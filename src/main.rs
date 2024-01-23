@@ -9,9 +9,18 @@ async fn main() {
     env::set_var("RUST_LOG", "info");
     env_logger::init();
 
+    //  read the argument
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <port>", args[0]);
+        return;
+    }
+    let port = &args[1];
+    let address = format!("127.0.0.1:{}", port);
+
     //  Create a TCP listener
-    let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    info!("Server running on port 8080");
+    let listener = TcpListener::bind(address).await.unwrap();
+    info!("Server running on port {}", port);
 
     //  listen for messages
     loop {
