@@ -1,10 +1,12 @@
 use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::error::Error as SerdeError;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -116,7 +118,6 @@ impl Node {
 
     async fn start_election(&mut self) {
         //  Increment the current term, become candidate and vote for self
-        info!("This node is starting an election!");
         self.state = State::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -139,11 +140,8 @@ impl Node {
                     stream.read_to_string(&mut response).await.unwrap();
                     let vote_response: RequestVoteResponse =
                         serde_json::from_str(&response).unwrap();
-                    info!("received vote response");
                 }
                 Err(e) => {
-                    error!("Failed to connect to peer {}:{}", peer, e);
-                    error!("Resetting state to follower");
                     self.state = State::Follower;
                     self.voted_for = None;
                     return;
@@ -155,36 +153,54 @@ impl Node {
 
 async fn listen_for_messages(local_port: &str, node: Arc<Mutex<Node>>) -> io::Result<()> {
     let address = format!("127.0.0.1:{}", local_port);
-    info!("Address {}", address);
-    let listener = TcpListener::bind(address).await.unwrap();
     info!("Server running on port {}", local_port);
+    let listener = TcpListener::bind(address).await?;
+
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
         let node_clone = Arc::clone(&node);
 
         tokio::spawn(async move {
-            let mut buf = String::new();
-            match socket.read_to_string(&mut buf).await {
-                Ok(_) => match serde_json::from_str::<RequestVoteRequest>(&buf) {
-                    Ok(request_vote) => {
-                        let mut node_guard = node_clone.lock().await;
-                        let RequestVoteResponse { term, vote_granted } =
-                            node_guard.handle_request_vote(request_vote).await;
+            let mut reader = BufReader::new(socket);
 
-                        let serialized_response =
-                            serde_json::to_string(&RequestVoteResponse { term, vote_granted })
-                                .unwrap();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(bytes_read) => {
+                        if bytes_read == 0 {
+                            // End of stream
+                            break;
+                        }
 
-                        match socket.write_all(serialized_response.as_bytes()).await {
-                            Ok(_) => {}
-                            Err(_) => {
-                                error!("Failed to write the response for vote request back");
+                        match serde_json::from_str::<RequestVoteRequest>(&line.trim_end()) {
+                            Ok(request_vote) => {
+                                let mut node_guard = node_clone.lock().await;
+                                let response: RequestVoteResponse =
+                                    node_guard.handle_request_vote(request_vote).await;
+                                let serialized_response = serde_json::to_string(&response).unwrap();
+
+                                if let Err(e) = reader
+                                    .get_mut()
+                                    .write_all(serialized_response.as_bytes())
+                                    .await
+                                {
+                                    error!("Failed to write the response back: {}", e);
+                                    break;
+                                }
+                                //  sent the response - break out of the loop
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Failed to parse the request: {}", e);
+                                break;
                             }
                         }
                     }
-                    Err(_) => {}
-                },
-                Err(_) => {}
+                    Err(e) => {
+                        error!("Failed to read from socket: {}", e);
+                        break;
+                    }
+                }
             }
         });
     }
@@ -205,11 +221,7 @@ async fn main() {
 
     //  initialize variables
     let local_address = format!("127.0.0.1:{}", &args[1]);
-    let all_addresses = vec![
-        "127.0.0.1:8080".to_string(),
-        "127.0.0.1:8081".to_string(),
-        "127.0.0.1:8082".to_string(),
-    ];
+    let all_addresses = vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()];
     let node = Arc::new(Mutex::new(Node::new(local_address, all_addresses)));
     let node_for_listener = Arc::clone(&node);
     let election_timeout = Duration::from_millis(1000);
@@ -233,7 +245,6 @@ async fn main() {
             && node_guard.voted_for == None
         {
             //  start an election
-            info!("Starting an election");
             node_guard.start_election().await;
         }
 

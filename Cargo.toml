@@ -13,3 +13,7 @@ log = "0.4"
 env_logger = "0.9"
 uuid = { version = "1.7.0", features=["v4", "serde"] }
 rand = "0.8.5"
+
+[[bin]]
+name = "client"
+path = "bin/client.rs"
