@@ -2,10 +2,12 @@ use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 //  the possible states a node can take on
@@ -36,7 +38,7 @@ struct Node {
 #[derive(Serialize, Deserialize)]
 struct RequestVoteRequest {
     term: u32,
-    candidate_id: u32,
+    candidate_id: Uuid,
     last_log_index: u32,
     last_log_term: u32,
 }
@@ -73,7 +75,7 @@ impl Node {
     fn request_vote(&self) -> RequestVoteRequest {
         return RequestVoteRequest {
             term: self.current_term,
-            candidate_id: 0,
+            candidate_id: self.id,
             last_log_index: 0,
             last_log_term: 0,
         };
@@ -82,7 +84,8 @@ impl Node {
      * This method is called when a vote is requested of this node
      * It should return the current term and whether or not the vote was granted
      */
-    async fn handle_request_vote(request: RequestVoteRequest) -> RequestVoteResponse {
+    async fn handle_request_vote(&mut self, request: RequestVoteRequest) -> RequestVoteResponse {
+        //  when sending a vote to some other node, set the voted for field
         return RequestVoteResponse {
             term: 0,
             vote_granted: false,
@@ -113,6 +116,7 @@ impl Node {
 
     async fn start_election(&mut self) {
         //  Increment the current term, become candidate and vote for self
+        info!("This node is starting an election!");
         self.state = State::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -139,28 +143,33 @@ impl Node {
                 }
                 Err(e) => {
                     error!("Failed to connect to peer {}:{}", peer, e);
+                    error!("Resetting state to follower");
+                    self.state = State::Follower;
+                    self.voted_for = None;
+                    return;
                 }
             }
         }
     }
 }
 
-async fn listen_for_messages(local_port: &str) -> io::Result<()> {
+async fn listen_for_messages(local_port: &str, node: Arc<Mutex<Node>>) -> io::Result<()> {
     let address = format!("127.0.0.1:{}", local_port);
     info!("Address {}", address);
     let listener = TcpListener::bind(address).await.unwrap();
     info!("Server running on port {}", local_port);
     loop {
         let (mut socket, _) = listener.accept().await?;
+        let node_clone = Arc::clone(&node);
 
         tokio::spawn(async move {
             let mut buf = String::new();
             match socket.read_to_string(&mut buf).await {
                 Ok(_) => match serde_json::from_str::<RequestVoteRequest>(&buf) {
                     Ok(request_vote) => {
-                        //  received a vote request from some other node
+                        let mut node_guard = node_clone.lock().await;
                         let RequestVoteResponse { term, vote_granted } =
-                            Node::handle_request_vote(request_vote).await;
+                            node_guard.handle_request_vote(request_vote).await;
 
                         let serialized_response =
                             serde_json::to_string(&RequestVoteResponse { term, vote_granted })
@@ -201,21 +210,31 @@ async fn main() {
         "127.0.0.1:8081".to_string(),
         "127.0.0.1:8082".to_string(),
     ];
-    let node = Node::new(local_address, all_addresses);
+    let node = Arc::new(Mutex::new(Node::new(local_address, all_addresses)));
+    let node_for_listener = Arc::clone(&node);
     let election_timeout = Duration::from_millis(1000);
 
     //  listen for messages on a separate thread
     tokio::spawn(async move {
-        if let Err(e) = listen_for_messages(&args[1]).await {
+        if let Err(e) = listen_for_messages(&args[1], node_for_listener).await {
             error!("Failed to listen to messages; err={:?}", e);
         }
     });
 
     //  main loop
     loop {
-        if node.state == State::Follower && node.election_timeout_elapsed(election_timeout) {
+        let mut node_guard = node.lock().await;
+        //  start an election only if the following conditions are met:
+        // 1. The node is a follower
+        // 2. The election timeout has elapsed
+        // 3. The node has not yet voted for anyone in this term
+        if node_guard.state == State::Follower
+            && node_guard.election_timeout_elapsed(election_timeout)
+            && node_guard.voted_for == None
+        {
             //  start an election
-            info!("Should start an election");
+            info!("Starting an election");
+            node_guard.start_election().await;
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
