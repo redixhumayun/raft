@@ -1,12 +1,15 @@
 use log::{error, info};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
 //  the possible states a node can take on
+#[derive(PartialEq)]
 enum State {
     Follower,
     Candidate,
@@ -22,9 +25,12 @@ struct Node {
     id: Uuid,
     state: State,
     current_term: u32,
-    voted_for: Option<u32>,
+    voted_for: Option<Uuid>,
     log: Vec<LogEntry>,
     last_heartbeat: Instant,
+    address: String,
+    peers: Vec<String>,
+    election_timeout: Duration,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,7 +51,10 @@ impl Node {
     /**
      * Constructor for a raft node. All nodes start as followers with no logs
      */
-    fn new() -> Self {
+    fn new(address: String, peers: Vec<String>) -> Self {
+        let peers = peers.into_iter().filter(|peer| peer != &address).collect();
+        //  add jitter to the election timeout
+        let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..1000));
         Self {
             id: Uuid::new_v4(),
             state: State::Follower,
@@ -53,12 +62,15 @@ impl Node {
             voted_for: None,
             log: Vec::new(),
             last_heartbeat: Instant::now(),
+            address,
+            peers,
+            election_timeout,
         }
     }
     /**
      * This method is called when this node requests a vote from other nodes
      */
-    async fn request_vote(&self) -> RequestVoteRequest {
+    fn request_vote(&self) -> RequestVoteRequest {
         return RequestVoteRequest {
             term: self.current_term,
             candidate_id: 0,
@@ -94,10 +106,49 @@ impl Node {
     fn heartbeat_received(&mut self) {
         self.last_heartbeat = Instant::now();
     }
+
+    fn election_timeout_elapsed(&self, election_timeout: Duration) -> bool {
+        self.last_heartbeat.elapsed() > election_timeout
+    }
+
+    async fn start_election(&mut self) {
+        //  Increment the current term, become candidate and vote for self
+        self.state = State::Candidate;
+        self.current_term += 1;
+        self.voted_for = Some(self.id);
+
+        //  Create the request struct
+        let vote_request = self.request_vote();
+        let serialized_request = serde_json::to_string(&vote_request).unwrap();
+
+        //  Send a request to obtain votes from other candidates
+        for peer in &self.peers {
+            //  make the request
+            match TcpStream::connect(peer).await {
+                Ok(mut stream) => {
+                    stream
+                        .write_all(serialized_request.as_bytes())
+                        .await
+                        .unwrap();
+
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).await.unwrap();
+                    let vote_response: RequestVoteResponse =
+                        serde_json::from_str(&response).unwrap();
+                    info!("received vote response");
+                }
+                Err(e) => {
+                    error!("Failed to connect to peer {}:{}", peer, e);
+                }
+            }
+        }
+    }
 }
 
 async fn listen_for_messages(local_port: &str) -> io::Result<()> {
-    let listener = TcpListener::bind(local_port).await.unwrap();
+    let address = format!("127.0.0.1:{}", local_port);
+    info!("Address {}", address);
+    let listener = TcpListener::bind(address).await.unwrap();
     info!("Server running on port {}", local_port);
     loop {
         let (mut socket, _) = listener.accept().await?;
@@ -117,7 +168,9 @@ async fn listen_for_messages(local_port: &str) -> io::Result<()> {
 
                         match socket.write_all(serialized_response.as_bytes()).await {
                             Ok(_) => {}
-                            Err(_) => {}
+                            Err(_) => {
+                                error!("Failed to write the response for vote request back");
+                            }
                         }
                     }
                     Err(_) => {}
@@ -140,41 +193,31 @@ async fn main() {
         eprintln!("Usage: {} <port>", args[0]);
         return;
     }
-    let port = &args[1];
-    let address = format!("127.0.0.1:{}", port);
 
-    //  Create a TCP listener
-    let listener = TcpListener::bind(address).await.unwrap();
-    info!("Server running on port {}", port);
+    //  initialize variables
+    let local_address = format!("127.0.0.1:{}", &args[1]);
+    let all_addresses = vec![
+        "127.0.0.1:8080".to_string(),
+        "127.0.0.1:8081".to_string(),
+        "127.0.0.1:8082".to_string(),
+    ];
+    let node = Node::new(local_address, all_addresses);
+    let election_timeout = Duration::from_millis(1000);
 
-    //  listen for messages
-    loop {
-        match listener.accept().await {
-            Ok((mut socket, addr)) => {
-                info!("New connection from: {}", addr);
-
-                tokio::spawn(async move {
-                    let mut buf = [0; 1024];
-
-                    loop {
-                        //  read the data
-                        let n = match socket.read(&mut buf).await {
-                            Ok(n) if n == 0 => return,
-                            Ok(n) => n,
-                            Err(err) => {
-                                error!("Failed to read from socket; err={:?}", err);
-                                return;
-                            }
-                        };
-                        //  write the data
-                        if let Err(e) = socket.write_all(&buf[0..n]).await {
-                            error!("Failed to write back to socket; err={:?}", e);
-                            return;
-                        }
-                    }
-                });
-            }
-            Err(err) => error!("Failed to accept connection: {}", err),
+    //  listen for messages on a separate thread
+    tokio::spawn(async move {
+        if let Err(e) = listen_for_messages(&args[1]).await {
+            error!("Failed to listen to messages; err={:?}", e);
         }
+    });
+
+    //  main loop
+    loop {
+        if node.state == State::Follower && node.election_timeout_elapsed(election_timeout) {
+            //  start an election
+            info!("Should start an election");
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
