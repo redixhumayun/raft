@@ -45,7 +45,7 @@ struct RequestVoteRequest {
     last_log_term: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct RequestVoteResponse {
     term: u32,
     vote_granted: bool,
@@ -124,7 +124,7 @@ impl Node {
 
         //  Create the request struct
         let vote_request = self.request_vote();
-        let serialized_request = serde_json::to_string(&vote_request).unwrap();
+        let serialized_request = serde_json::to_string(&vote_request).unwrap() + "\n";
 
         //  Send a request to obtain votes from other candidates
         for peer in &self.peers {
@@ -140,6 +140,7 @@ impl Node {
                     stream.read_to_string(&mut response).await.unwrap();
                     let vote_response: RequestVoteResponse =
                         serde_json::from_str(&response).unwrap();
+                    info!("The response is: {:?}", vote_response);
                 }
                 Err(e) => {
                     self.state = State::Follower;
@@ -148,6 +149,11 @@ impl Node {
                 }
             }
         }
+        info!("Resetting the variables");
+        self.last_heartbeat = Instant::now();
+        self.voted_for = None;
+        self.current_term -= 1;
+        self.state = State::Follower;
     }
 }
 
@@ -174,6 +180,7 @@ async fn listen_for_messages(local_port: &str, node: Arc<Mutex<Node>>) -> io::Re
 
                         match serde_json::from_str::<RequestVoteRequest>(&line.trim_end()) {
                             Ok(request_vote) => {
+                                info!("Received a request for a vote");
                                 let mut node_guard = node_clone.lock().await;
                                 let response: RequestVoteResponse =
                                     node_guard.handle_request_vote(request_vote).await;
@@ -224,7 +231,6 @@ async fn main() {
     let all_addresses = vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()];
     let node = Arc::new(Mutex::new(Node::new(local_address, all_addresses)));
     let node_for_listener = Arc::clone(&node);
-    let election_timeout = Duration::from_millis(1000);
 
     //  listen for messages on a separate thread
     tokio::spawn(async move {
@@ -241,13 +247,13 @@ async fn main() {
         // 2. The election timeout has elapsed
         // 3. The node has not yet voted for anyone in this term
         if node_guard.state == State::Follower
-            && node_guard.election_timeout_elapsed(election_timeout)
+            && node_guard.election_timeout_elapsed(node_guard.election_timeout)
             && node_guard.voted_for == None
         {
             //  start an election
             node_guard.start_election().await;
         }
-
+        drop(node_guard);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
