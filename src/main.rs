@@ -157,57 +157,50 @@ impl Node {
     }
 }
 
+async fn process_connection(
+    mut reader: BufReader<TcpStream>,
+    node: Arc<Mutex<Node>>,
+) -> io::Result<()> {
+    let mut line = String::new();
+    while reader.read_line(&mut line).await? != 0 {
+        //  keep reading until EOF
+        let request_vote = match serde_json::from_str(&line.trim_end()) {
+            Ok(request) => request,
+            Err(e) => {
+                error!("Failed to process the request {}", e);
+                continue;
+            }
+        };
+        let mut node_guard = node.lock().await;
+        let response = node_guard.handle_request_vote(request_vote).await;
+        let serialized_response = serde_json::to_string(&response).unwrap();
+        if let Err(e) = reader
+            .get_mut()
+            .write_all(serialized_response.as_bytes())
+            .await
+        {
+            error!("Failed to write response back: {}", e);
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
 async fn listen_for_messages(local_port: &str, node: Arc<Mutex<Node>>) -> io::Result<()> {
     let address = format!("127.0.0.1:{}", local_port);
     info!("Server running on port {}", local_port);
     let listener = TcpListener::bind(address).await?;
 
+    //  keep listening for connections
     loop {
         let (socket, _) = listener.accept().await?;
         let node_clone = Arc::clone(&node);
+        let reader = BufReader::new(socket);
 
+        //  spawn a separate thread to process the request
         tokio::spawn(async move {
-            let mut reader = BufReader::new(socket);
-
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(bytes_read) => {
-                        if bytes_read == 0 {
-                            // End of stream
-                            break;
-                        }
-
-                        match serde_json::from_str::<RequestVoteRequest>(&line.trim_end()) {
-                            Ok(request_vote) => {
-                                info!("Received a request for a vote");
-                                let mut node_guard = node_clone.lock().await;
-                                let response: RequestVoteResponse =
-                                    node_guard.handle_request_vote(request_vote).await;
-                                let serialized_response = serde_json::to_string(&response).unwrap();
-
-                                if let Err(e) = reader
-                                    .get_mut()
-                                    .write_all(serialized_response.as_bytes())
-                                    .await
-                                {
-                                    error!("Failed to write the response back: {}", e);
-                                    break;
-                                }
-                                //  sent the response - break out of the loop
-                                break;
-                            }
-                            Err(e) => {
-                                error!("Failed to parse the request: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read from socket: {}", e);
-                        break;
-                    }
-                }
+            if let Err(e) = process_connection(reader, node_clone).await {
+                error!("Error processing connection {}", e);
             }
         });
     }
