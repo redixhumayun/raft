@@ -87,10 +87,19 @@ impl Node {
      * It should return the current term and whether or not the vote was granted
      */
     async fn handle_request_vote(&mut self, request: RequestVoteRequest) -> RequestVoteResponse {
-        //  when sending a vote to some other node, set the voted for field
+        if request.term < self.current_term || self.voted_for != None {
+            //  cannot grant node a vote
+            return RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
+        //  casting a vote
+        self.voted_for = Some(request.candidate_id);
         return RequestVoteResponse {
-            term: 0,
-            vote_granted: false,
+            term: self.current_term,
+            vote_granted: true,
         };
     }
 
@@ -171,13 +180,18 @@ impl Node {
             };
 
             info!("The response is: {:?}", vote_response);
+            if vote_response.term > self.current_term {
+                info!("This node is not in the current term, update it and give up on leader election");
+                self.current_term = vote_response.term;
+                break;
+            }
             if vote_response.vote_granted {
                 votes += 1;
             }
         }
         info!("Here");
         info!("Votes: {}, self.peers: {}", votes, self.peers.len());
-        if false {
+        if votes > (self.peers.len() / 2) {
             info!("Elected leader");
             self.state = State::Leader;
             return;
@@ -188,6 +202,7 @@ impl Node {
         self.voted_for = None;
         self.current_term -= 1;
         self.state = State::Follower;
+        return;
     }
 }
 
@@ -255,7 +270,11 @@ async fn main() {
 
     //  initialize variables
     let local_address = format!("127.0.0.1:{}", &args[1]);
-    let all_addresses = vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()];
+    let all_addresses = vec![
+        "127.0.0.1:8080".to_string(),
+        "127.0.0.1:8081".to_string(),
+        "127.0.0.1:8082".to_string(),
+    ];
     let node = Arc::new(Mutex::new(Node::new(local_address, all_addresses)));
     let node_for_listener = Arc::clone(&node);
 
