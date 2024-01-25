@@ -174,30 +174,6 @@ impl Node {
             if vote_response.vote_granted {
                 votes += 1;
             }
-
-            // match TcpStream::connect(peer).await {
-            //     Ok(mut stream) => {
-            //         stream
-            //             .write_all(serialized_request.as_bytes())
-            //             .await
-            //             .unwrap();
-
-            //         let mut response = String::new();
-            //         stream.read_to_string(&mut response).await.unwrap();
-            //         let vote_response: RequestVoteResponse =
-            //             serde_json::from_str(&response).unwrap();
-            //         info!("The response is: {:?}", vote_response);
-            //         if vote_response.vote_granted {
-            //             votes += 1;
-            //         }
-            //     }
-            //     Err(e) => {
-            //         error!("Failed to connect to the peer: {}", e);
-            //         self.state = State::Follower;
-            //         self.voted_for = None;
-            //         return;
-            //     }
-            // }
         }
         info!("Here");
         info!("Votes: {}, self.peers: {}", votes, self.peers.len());
