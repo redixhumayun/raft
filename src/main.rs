@@ -126,30 +126,88 @@ impl Node {
         let vote_request = self.request_vote();
         let serialized_request = serde_json::to_string(&vote_request).unwrap() + "\n";
 
+        let mut votes = 1;
+
         //  Send a request to obtain votes from other candidates
         for peer in &self.peers {
-            //  make the request
-            match TcpStream::connect(peer).await {
-                Ok(mut stream) => {
-                    stream
-                        .write_all(serialized_request.as_bytes())
-                        .await
-                        .unwrap();
-
-                    let mut response = String::new();
-                    stream.read_to_string(&mut response).await.unwrap();
-                    let vote_response: RequestVoteResponse =
-                        serde_json::from_str(&response).unwrap();
-                    info!("The response is: {:?}", vote_response);
-                }
+            //  connect to the peer
+            let mut stream = match TcpStream::connect(peer).await {
+                Ok(stream) => stream,
                 Err(e) => {
+                    error!("Failed to connect to the peer: {}", e);
                     self.state = State::Follower;
                     self.voted_for = None;
                     return;
                 }
+            };
+
+            //  write the request to the stream
+            match stream.write_all(serialized_request.as_bytes()).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed to write to the stream: {}", e);
+                    continue;
+                }
+            };
+
+            //  read the response from the stream assuming a single line followed by a new line
+            let mut reader = BufReader::new(stream);
+            let mut response = String::new();
+            match reader.read_line(&mut response).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Failed to read the response from the stream: {}", e);
+                    continue;
+                }
             }
+
+            //  update based on response
+            let vote_response: RequestVoteResponse = match serde_json::from_str(&response) {
+                Ok(response) => response,
+                Err(e) => {
+                    error!("Failed to deserialize the response: {}", e);
+                    continue;
+                }
+            };
+
+            info!("The response is: {:?}", vote_response);
+            if vote_response.vote_granted {
+                votes += 1;
+            }
+
+            // match TcpStream::connect(peer).await {
+            //     Ok(mut stream) => {
+            //         stream
+            //             .write_all(serialized_request.as_bytes())
+            //             .await
+            //             .unwrap();
+
+            //         let mut response = String::new();
+            //         stream.read_to_string(&mut response).await.unwrap();
+            //         let vote_response: RequestVoteResponse =
+            //             serde_json::from_str(&response).unwrap();
+            //         info!("The response is: {:?}", vote_response);
+            //         if vote_response.vote_granted {
+            //             votes += 1;
+            //         }
+            //     }
+            //     Err(e) => {
+            //         error!("Failed to connect to the peer: {}", e);
+            //         self.state = State::Follower;
+            //         self.voted_for = None;
+            //         return;
+            //     }
+            // }
         }
-        info!("Resetting the variables");
+        info!("Here");
+        info!("Votes: {}, self.peers: {}", votes, self.peers.len());
+        if false {
+            info!("Elected leader");
+            self.state = State::Leader;
+            return;
+        }
+
+        info!("Failed to be elected leader, resetting to defaults");
         self.last_heartbeat = Instant::now();
         self.voted_for = None;
         self.current_term -= 1;
@@ -173,7 +231,7 @@ async fn process_connection(
         };
         let mut node_guard = node.lock().await;
         let response = node_guard.handle_request_vote(request_vote).await;
-        let serialized_response = serde_json::to_string(&response).unwrap();
+        let serialized_response = serde_json::to_string(&response).unwrap() + "\n";
         if let Err(e) = reader
             .get_mut()
             .write_all(serialized_response.as_bytes())
