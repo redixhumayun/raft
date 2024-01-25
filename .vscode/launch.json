@@ -1,0 +1,82 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'client'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=client",
+          "--package=raft"
+        ],
+        "filter": {
+          "name": "client",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'client'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=client",
+          "--package=raft"
+        ],
+        "filter": {
+          "name": "client",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'raft'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=raft",
+          "--package=raft"
+        ],
+        "filter": {
+          "name": "raft",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'raft'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=raft",
+          "--package=raft"
+        ],
+        "filter": {
+          "name": "raft",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

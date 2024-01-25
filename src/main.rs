@@ -1,16 +1,19 @@
+use core::num;
 use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::error::Error as SerdeError;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+trait Time {
+    fn now(&self) -> Instant;
+}
 
 //  the possible states a node can take on
 #[derive(PartialEq)]
@@ -35,6 +38,7 @@ struct Node {
     address: String,
     peers: Vec<String>,
     election_timeout: Duration,
+    port: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,7 +59,7 @@ impl Node {
     /**
      * Constructor for a raft node. All nodes start as followers with no logs
      */
-    fn new(address: String, peers: Vec<String>) -> Self {
+    fn new(port: u32, address: String, peers: Vec<String>) -> Self {
         let peers = peers.into_iter().filter(|peer| peer != &address).collect();
         //  add jitter to the election timeout
         let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..1000));
@@ -69,6 +73,7 @@ impl Node {
             address,
             peers,
             election_timeout,
+            port,
         }
     }
     /**
@@ -127,6 +132,7 @@ impl Node {
 
     async fn start_election(&mut self) {
         //  Increment the current term, become candidate and vote for self
+        info!("Starting election");
         self.state = State::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -235,9 +241,10 @@ async fn process_connection(
     Ok(())
 }
 
-async fn listen_for_messages(local_port: &str, node: Arc<Mutex<Node>>) -> io::Result<()> {
-    let address = format!("127.0.0.1:{}", local_port);
-    info!("Server running on port {}", local_port);
+async fn listen_for_messages(node: Arc<Mutex<Node>>) -> io::Result<()> {
+    let port = node.lock().await.port;
+    let address = format!("127.0.0.1:{}", port);
+    info!("Server running on port {}", port);
     let listener = TcpListener::bind(address).await?;
 
     //  keep listening for connections
@@ -267,6 +274,7 @@ async fn main() {
         eprintln!("Usage: {} <port>", args[0]);
         return;
     }
+    let port: u32 = args[1].parse().expect("Port should be a number");
 
     //  initialize variables
     let local_address = format!("127.0.0.1:{}", &args[1]);
@@ -275,12 +283,12 @@ async fn main() {
         "127.0.0.1:8081".to_string(),
         "127.0.0.1:8082".to_string(),
     ];
-    let node = Arc::new(Mutex::new(Node::new(local_address, all_addresses)));
+    let node = Arc::new(Mutex::new(Node::new(port, local_address, all_addresses)));
     let node_for_listener = Arc::clone(&node);
 
     //  listen for messages on a separate thread
     tokio::spawn(async move {
-        if let Err(e) = listen_for_messages(&args[1], node_for_listener).await {
+        if let Err(e) = listen_for_messages(node_for_listener).await {
             error!("Failed to listen to messages; err={:?}", e);
         }
     });
@@ -302,4 +310,51 @@ async fn main() {
         drop(node_guard);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn initialize_cluster(ports: Vec<u32>) -> Vec<Arc<Mutex<Node>>> {
+    let mut nodes = Vec::new();
+
+    let all_addresses = ports
+        .iter()
+        .map(|port| format!("127.0.0.1:{}", port))
+        .collect::<Vec<_>>();
+    for port in &ports {
+        let local_address = format!("127.0.0.1:{}", port);
+        let node = Arc::new(Mutex::new(Node::new(
+            *port,
+            local_address,
+            all_addresses.clone(),
+        )));
+        nodes.push(node);
+    }
+    return nodes;
+}
+
+#[tokio::test]
+async fn test_leader_election() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let ports = vec![8080, 8081, 8082];
+    let nodes = initialize_cluster(ports);
+
+    //  start the listener process on each node
+    for node in &nodes {
+        let node_for_listener = Arc::clone(&node);
+        tokio::spawn(async move {
+            listen_for_messages(node_for_listener).await.unwrap();
+        });
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    //  trigger an election on one of the nodes
+    {
+        let mut node_guard = nodes[0].lock().await;
+        node_guard.start_election().await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    info!("acq node guard");
+    let node_guard = nodes[0].lock().await;
+    assert!(node_guard.state == State::Leader);
 }
