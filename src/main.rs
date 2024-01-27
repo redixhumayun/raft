@@ -1,15 +1,18 @@
 use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::env;
 use std::sync::Arc;
+use std::thread::current;
 use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::stream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use warp::Filter;
 
 trait Time {
     fn now(&self) -> Instant;
@@ -23,10 +26,12 @@ enum State {
     Leader,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct LogEntry {
     key: String,
     value: i32,
+    term: u32,
+    index: u32,
 }
 
 struct Node {
@@ -41,6 +46,7 @@ struct Node {
     heartbeat_interval: Duration,
     last_heartbeat: Instant,
     port: u32,
+    current_leader: Option<Uuid>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,6 +106,7 @@ impl Node {
             heartbeat_interval,
             last_heartbeat: Instant::now(),
             port,
+            current_leader: None,
         }
     }
     /**
@@ -164,7 +171,10 @@ impl Node {
         if term < self.current_term {
             return (term, false);
         }
-
+        //  if current_leader is not set, set it
+        if self.current_leader == None {
+            self.current_leader = Some(leader_id);
+        }
         self.heartbeat_received();
         return (self.current_term, true);
     }
@@ -175,6 +185,18 @@ impl Node {
 
     fn election_timeout_elapsed(&self, election_timeout: Duration) -> bool {
         self.last_heartbeat.elapsed() > election_timeout
+    }
+
+    fn is_leader(&self) -> bool {
+        return self.state == State::Leader && self.current_leader == Some(self.id);
+    }
+
+    fn update_leader(&mut self, leader: Uuid) {
+        self.current_leader = Some(leader);
+    }
+
+    fn get_leader(&self) -> Option<Uuid> {
+        return self.current_leader;
     }
 }
 
@@ -196,6 +218,55 @@ async fn run_heartbeat_mechanism(node: Arc<Mutex<Node>>) {
         interval.tick().await;
         send_heartbeat(node.clone()).await;
     }
+}
+
+async fn send_log_entry(node: Arc<Mutex<Node>>, log_entry: LogEntry) -> bool {
+    let mut node_guard = node.lock().await;
+    if node_guard.state != State::Leader {
+        info!("Cannot send the log entry, returning");
+        return false;
+    }
+
+    info!("Sending log request");
+    let last_log_term = node_guard.log.last().map_or(0, |entry| entry.term);
+    let log_entry_clone = log_entry.clone();
+    let append_entry_req = AppendEntryRequest {
+        term: log_entry.term,
+        leader_id: node_guard.get_leader().unwrap(),
+        prev_log_term: last_log_term,
+        entries: vec![log_entry],
+        leader_commit: log_entry_clone.index,
+    };
+
+    let message = Message::AppendEntry(append_entry_req);
+    let serialized_request = serde_json::to_string(&message).unwrap() + "\n";
+    for peer in &node_guard.peers {
+        let response = match communicate_with_peer(peer, &serialized_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to communicate with peer: {}", e);
+                continue;
+            }
+        };
+
+        let append_entries_response: AppendEntryResponse = match serde_json::from_str(&response) {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to deserialize the response: {}", e);
+                continue;
+            }
+        };
+
+        if !append_entries_response.success
+            && append_entries_response.term > node_guard.current_term
+        {
+            info!("There is a new leader, stepping down");
+            node_guard.current_term = append_entries_response.term;
+            node_guard.state = State::Follower;
+            return false;
+        }
+    }
+    return true;
 }
 
 async fn send_heartbeat(node: Arc<Mutex<Node>>) {
@@ -367,6 +438,62 @@ async fn listen_for_messages(node: Arc<Mutex<Node>>) -> io::Result<()> {
     }
 }
 
+async fn handle_set_key_value_pair(
+    key: String,
+    value: i32,
+    node: Arc<Mutex<Node>>,
+) -> Result<impl warp::Reply, Infallible> {
+    //  handle the submission here
+    //  check if this node is indeed the leader
+    let node_clone = Arc::clone(&node);
+    let node_guard = node.lock().await;
+    if !node_guard.is_leader() {
+        //  return a response indicating where the leader is
+        let current_leader = node_guard.get_leader();
+        let mut response = HashMap::new();
+        if current_leader.is_none() {
+            response.insert("message", "There is no leader set");
+        }
+        let leader = current_leader.unwrap().to_string();
+        response.insert("message", "This node is not the leader");
+        response.insert("current_leader", &leader);
+        return Ok(warp::reply::json(&response));
+    }
+
+    //  this node is the leader, append the key-value pair to your own log and then send the key-value pair to followers as well
+    let last_log_index = node_guard.log.last().map_or(0, |entry| entry.index);
+    let log_entry = LogEntry {
+        key,
+        value,
+        term: node_guard.current_term,
+        index: last_log_index + 1,
+    };
+    drop(node_guard);
+    let append_result = send_log_entry(node_clone, log_entry).await;
+    let append_result_str = append_result.to_string();
+    let mut response = HashMap::new();
+    response.insert("message", "");
+    response.insert("result", &append_result_str);
+    return Ok(warp::reply::json(&response));
+}
+
+fn with_node(
+    node: Arc<Mutex<Node>>,
+) -> impl Filter<Extract = (Arc<Mutex<Node>>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || node.clone())
+}
+
+async fn start_api(node: Arc<Mutex<Node>>, port: u16) {
+    let set_key_value_pair = warp::path!("submit" / String / i32)
+        .and(warp::post())
+        .and(with_node(node.clone()))
+        .and_then(handle_set_key_value_pair);
+
+    let routes = set_key_value_pair;
+
+    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+}
+
 #[tokio::main]
 async fn main() {
     //  initialize the logger
@@ -375,11 +502,12 @@ async fn main() {
 
     //  read the argument
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <port>", args[0]);
+    if args.len() != 3 {
+        eprintln!("Usage: {} <raft_port> <api_port>", args[0]);
         return;
     }
-    let port: u32 = args[1].parse().expect("Port should be a number");
+    let raft_port: u32 = args[1].parse().expect("Raft port should be a number");
+    let api_port: u16 = args[2].parse().expect("API port should be a number");
 
     //  initialize variables
     let local_address = format!("127.0.0.1:{}", &args[1]);
@@ -388,7 +516,11 @@ async fn main() {
         "127.0.0.1:8081".to_string(),
         "127.0.0.1:8082".to_string(),
     ];
-    let node = Arc::new(Mutex::new(Node::new(port, local_address, all_addresses)));
+    let node = Arc::new(Mutex::new(Node::new(
+        raft_port,
+        local_address,
+        all_addresses,
+    )));
     let node_for_listener = Arc::clone(&node);
 
     //  listen for messages on a separate thread
@@ -396,6 +528,12 @@ async fn main() {
         if let Err(e) = listen_for_messages(node_for_listener).await {
             error!("Failed to listen to messages; err={:?}", e);
         }
+    });
+
+    //  start the API
+    let api_node = node.clone();
+    tokio::spawn(async move {
+        start_api(api_node, api_port).await;
     });
 
     //  main loop
