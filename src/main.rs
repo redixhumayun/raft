@@ -200,7 +200,6 @@ async fn run_heartbeat_mechanism(node: Arc<Mutex<Node>>) {
 
 async fn send_heartbeat(node: Arc<Mutex<Node>>) {
     let mut node_guard = node.lock().await;
-    info!("Ensure that the node is still the leader");
     if node_guard.state != State::Leader {
         info!("Cannot send heartbeat, returning");
         return;
@@ -208,7 +207,8 @@ async fn send_heartbeat(node: Arc<Mutex<Node>>) {
 
     info!("Sending heartbeat");
     let append_entry_req = node_guard.append_entries();
-    let serialized_request = serde_json::to_string(&append_entry_req).unwrap() + "\n";
+    let message = Message::AppendEntry(append_entry_req);
+    let serialized_request = serde_json::to_string(&message).unwrap() + "\n";
     for peer in &node_guard.peers {
         let response = match communicate_with_peer(peer, &serialized_request).await {
             Ok(response) => response,
@@ -302,9 +302,9 @@ async fn process_message(
     let mut line = String::new();
     let mut node_guard = node.lock().await;
     while reader.read_line(&mut line).await? != 0 {
-        info!("The request is: {}", line);
         match serde_json::from_str(&line.trim_end()) {
             Ok(Message::RequestVote(request)) => {
+                info!("Received vote request");
                 let response = node_guard.handle_request_vote(request).await;
                 let serialized_response = serde_json::to_string(&response).unwrap() + "\n";
                 if let Err(e) = reader
@@ -316,6 +316,7 @@ async fn process_message(
                 }
             }
             Ok(Message::AppendEntry(request)) => {
+                info!("Received append entry");
                 let response = node_guard
                     .handle_append_entries(
                         request.term,
