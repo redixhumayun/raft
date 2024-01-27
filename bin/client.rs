@@ -1,26 +1,40 @@
-use serde_json::json;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::thread;
+use std::time::Duration;
+use tokio;
 
-fn main() -> std::io::Result<()> {
-    let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+#[tokio::main]
+async fn main() -> Result<(), reqwest::Error> {
+    let api_ports = vec![3000];
+    let mut counter = 0;
 
-    // Construct a simulated RequestVoteRequest JSON
-    let request_vote = json!({
-        "term": 1,
-        "candidate_id": "12345678-1234-1234-1234-1234567890ab", // Use a valid UUID
-        "last_log_index": 0,
-        "last_log_term": 0,
-    });
-    let serialized_request = serde_json::to_string(&request_vote).unwrap() + "\n";
+    loop {
+        let api_port = api_ports[counter % api_ports.len()];
+        counter += 1;
 
-    // Send the request
-    stream.write_all(serialized_request.as_bytes())?;
+        // Construct the key-value pair
+        let key = format!("{}", counter);
+        let value = counter;
 
-    // Read the response
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    println!("Response from server: {}", response);
+        // Construct the URL
+        let url = format!("http://127.0.0.1:{}/submit/{}/{}", api_port, key, value);
 
-    Ok(())
+        // Make the POST request
+        let client = reqwest::Client::new();
+        let response = client.post(&url).send().await?;
+
+        // Read the response
+        if response.status().is_success() {
+            let response_body = response.text().await?;
+            println!("Response from server {}: {}", api_port, response_body);
+        } else {
+            eprintln!(
+                "Error response from server {}: {}",
+                api_port,
+                response.status()
+            );
+        }
+
+        // Wait before sending the next request
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }

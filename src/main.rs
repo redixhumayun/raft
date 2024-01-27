@@ -173,9 +173,40 @@ impl Node {
         }
         //  if current_leader is not set, set it
         if self.current_leader == None {
-            self.current_leader = Some(leader_id);
+            info!(
+                "The current leader is None; setting it to: {:?}",
+                Some(leader_id)
+            );
+            self.update_leader(leader_id);
         }
         self.heartbeat_received();
+
+        if entries.len() == 0 {
+            //  this is a heartbeat message
+            return (self.current_term, true);
+        }
+
+        if prev_log_index != 0 {
+            //  only check if not the first entry
+            let entry = self.log.get(prev_log_index as usize);
+            if entry.is_none() {
+                info!(
+                    "Cannot append new entry because entry at previous index {} does not exist",
+                    prev_log_index
+                );
+                return (self.current_term, false);
+            }
+            if entry.unwrap().term != prev_log_term {
+                info!(
+                "Cannot append new entry because entry at previous index {} has a different term",
+                prev_log_index
+            );
+                return (self.current_term, false);
+            }
+        }
+
+        info!("Appending entry {:?} to log", entries[0]);
+        self.log.push(entries[0].clone()); //  assuming single log entry at a time
         return (self.current_term, true);
     }
 
@@ -227,6 +258,9 @@ async fn send_log_entry(node: Arc<Mutex<Node>>, log_entry: LogEntry) -> bool {
         return false;
     }
 
+    info!("Adding entry {:?} to leader log first", log_entry);
+    node_guard.log.push(log_entry.clone());
+
     info!("Sending log request");
     let last_log_term = node_guard.log.last().map_or(0, |entry| entry.term);
     let log_entry_clone = log_entry.clone();
@@ -244,7 +278,10 @@ async fn send_log_entry(node: Arc<Mutex<Node>>, log_entry: LogEntry) -> bool {
         let response = match communicate_with_peer(peer, &serialized_request).await {
             Ok(response) => response,
             Err(e) => {
-                error!("Failed to communicate with peer: {}", e);
+                error!(
+                    "Failed to communicate with peer {} when sending a log entry: {}",
+                    peer, e
+                );
                 continue;
             }
         };
@@ -276,7 +313,6 @@ async fn send_heartbeat(node: Arc<Mutex<Node>>) {
         return;
     }
 
-    info!("Sending heartbeat");
     let append_entry_req = node_guard.append_entries();
     let message = Message::AppendEntry(append_entry_req);
     let serialized_request = serde_json::to_string(&message).unwrap() + "\n";
@@ -284,7 +320,10 @@ async fn send_heartbeat(node: Arc<Mutex<Node>>) {
         let response = match communicate_with_peer(peer, &serialized_request).await {
             Ok(response) => response,
             Err(e) => {
-                error!("Failed to communicate with peer: {}", e);
+                error!(
+                    "Failed to communicate with peer {} while sending heartbeat: {}",
+                    peer, e
+                );
                 continue;
             }
         };
@@ -330,7 +369,10 @@ async fn start_election(node: Arc<Mutex<Node>>) {
         let response = match communicate_with_peer(peer, &serialized_request).await {
             Ok(response) => response,
             Err(e) => {
-                error!("Failed to communicate with peer: {}", e);
+                error!(
+                    "Failed to communicate with peer {} when running election: {}",
+                    peer, e
+                );
                 continue;
             }
         };
@@ -364,6 +406,8 @@ async fn start_election(node: Arc<Mutex<Node>>) {
     }
 
     node_guard.state = State::Leader;
+    let id = node_guard.id;
+    node_guard.update_leader(id);
 }
 
 async fn process_message(
@@ -387,7 +431,6 @@ async fn process_message(
                 }
             }
             Ok(Message::AppendEntry(request)) => {
-                info!("Received append entry");
                 let response = node_guard
                     .handle_append_entries(
                         request.term,
@@ -443,12 +486,15 @@ async fn handle_set_key_value_pair(
     value: i32,
     node: Arc<Mutex<Node>>,
 ) -> Result<impl warp::Reply, Infallible> {
-    //  handle the submission here
-    //  check if this node is indeed the leader
+    info!(
+        "Received a request to set the key value pair {} {}",
+        key, value
+    );
     let node_clone = Arc::clone(&node);
     let node_guard = node.lock().await;
     if !node_guard.is_leader() {
-        //  return a response indicating where the leader is
+        //  return a response indicating which node the leader is
+        info!("The current node is not the leader");
         let current_leader = node_guard.get_leader();
         let mut response = HashMap::new();
         if current_leader.is_none() {
