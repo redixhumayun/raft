@@ -1,4 +1,3 @@
-use core::num;
 use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -8,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::stream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -23,6 +23,7 @@ enum State {
     Leader,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct LogEntry {
     key: String,
     value: i32,
@@ -34,14 +35,15 @@ struct Node {
     current_term: u32,
     voted_for: Option<Uuid>,
     log: Vec<LogEntry>,
-    last_heartbeat: Instant,
     address: String,
     peers: Vec<String>,
     election_timeout: Duration,
+    heartbeat_interval: Duration,
+    last_heartbeat: Instant,
     port: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct RequestVoteRequest {
     term: u32,
     candidate_id: Uuid,
@@ -55,6 +57,28 @@ struct RequestVoteResponse {
     vote_granted: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct AppendEntryRequest {
+    term: u32,
+    leader_id: Uuid,
+    prev_log_term: u32,
+    entries: Vec<LogEntry>,
+    leader_commit: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct AppendEntryResponse {
+    term: u32,     //  the current term of the follower who responded
+    success: bool, //  whether the request was successful on the follower
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum Message {
+    RequestVote(RequestVoteRequest),
+    AppendEntry(AppendEntryRequest),
+}
+
 impl Node {
     /**
      * Constructor for a raft node. All nodes start as followers with no logs
@@ -63,16 +87,18 @@ impl Node {
         let peers = peers.into_iter().filter(|peer| peer != &address).collect();
         //  add jitter to the election timeout
         let election_timeout = Duration::from_millis(1000 + rand::thread_rng().gen_range(0..1000));
+        let heartbeat_interval = Duration::from_millis(100);
         Self {
             id: Uuid::new_v4(),
             state: State::Follower,
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
-            last_heartbeat: Instant::now(),
             address,
             peers,
             election_timeout,
+            heartbeat_interval,
+            last_heartbeat: Instant::now(),
             port,
         }
     }
@@ -109,17 +135,38 @@ impl Node {
     }
 
     /**
-     * This method is called when this node is requested to append entries to its own log from another node.
+     * This method is called when this node tries to append entries to its followers
+     * It also doubles as a heartbeat
      */
-    async fn append_entries(
+    fn append_entries(&self) -> AppendEntryRequest {
+        return AppendEntryRequest {
+            term: self.current_term,
+            leader_id: self.id,
+            prev_log_term: self.current_term,
+            entries: vec![],
+            leader_commit: 0,
+        };
+    }
+
+    /**
+     * Thi method is called when this node receives a request from a leader (presumably) to append an entry to itself
+     * It also doubles as a heartbeat
+     */
+    async fn handle_append_entries(
+        &mut self,
         term: u32,
-        leader_id: u32,
+        leader_id: Uuid,
         prev_log_index: u32,
         prev_log_term: u32,
         entries: Vec<LogEntry>,
         leader_commit: u32,
     ) -> (u32, bool) {
-        return (0, false);
+        if term < self.current_term {
+            return (term, false);
+        }
+
+        self.heartbeat_received();
+        return (self.current_term, true);
     }
 
     fn heartbeat_received(&mut self) {
@@ -129,114 +176,171 @@ impl Node {
     fn election_timeout_elapsed(&self, election_timeout: Duration) -> bool {
         self.last_heartbeat.elapsed() > election_timeout
     }
+}
 
-    async fn start_election(&mut self) {
-        //  Increment the current term, become candidate and vote for self
-        info!("Starting election");
-        self.state = State::Candidate;
-        self.current_term += 1;
-        self.voted_for = Some(self.id);
+async fn communicate_with_peer(peer: &str, serialized_request: &str) -> Result<String, io::Error> {
+    let mut stream = TcpStream::connect(peer).await?;
+    stream.write_all(serialized_request.as_bytes()).await?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    Ok(response)
+}
 
-        //  Create the request struct
-        let vote_request = self.request_vote();
-        let serialized_request = serde_json::to_string(&vote_request).unwrap() + "\n";
+async fn run_heartbeat_mechanism(node: Arc<Mutex<Node>>) {
+    let node_guard = node.lock().await;
+    let mut interval = tokio::time::interval(node_guard.heartbeat_interval);
+    drop(node_guard);
 
-        let mut votes = 1;
-
-        //  Send a request to obtain votes from other candidates
-        for peer in &self.peers {
-            //  connect to the peer
-            let mut stream = match TcpStream::connect(peer).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    error!("Failed to connect to the peer: {}", e);
-                    self.state = State::Follower;
-                    self.voted_for = None;
-                    return;
-                }
-            };
-
-            //  write the request to the stream
-            match stream.write_all(serialized_request.as_bytes()).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Failed to write to the stream: {}", e);
-                    continue;
-                }
-            };
-
-            //  read the response from the stream assuming a single line followed by a new line
-            let mut reader = BufReader::new(stream);
-            let mut response = String::new();
-            match reader.read_line(&mut response).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Failed to read the response from the stream: {}", e);
-                    continue;
-                }
-            }
-
-            //  update based on response
-            let vote_response: RequestVoteResponse = match serde_json::from_str(&response) {
-                Ok(response) => response,
-                Err(e) => {
-                    error!("Failed to deserialize the response: {}", e);
-                    continue;
-                }
-            };
-
-            info!("The response is: {:?}", vote_response);
-            if vote_response.term > self.current_term {
-                info!("This node is not in the current term, update it and give up on leader election");
-                self.current_term = vote_response.term;
-                break;
-            }
-            if vote_response.vote_granted {
-                votes += 1;
-            }
-        }
-        info!("Here");
-        info!("Votes: {}, self.peers: {}", votes, self.peers.len());
-        if votes > (self.peers.len() / 2) {
-            info!("Elected leader");
-            self.state = State::Leader;
-            return;
-        }
-
-        info!("Failed to be elected leader, resetting to defaults");
-        self.last_heartbeat = Instant::now();
-        self.voted_for = None;
-        self.current_term -= 1;
-        self.state = State::Follower;
-        return;
+    loop {
+        interval.tick().await;
+        send_heartbeat(node.clone()).await;
     }
 }
 
-async fn process_connection(
+async fn send_heartbeat(node: Arc<Mutex<Node>>) {
+    let mut node_guard = node.lock().await;
+    info!("Ensure that the node is still the leader");
+    if node_guard.state != State::Leader {
+        info!("Cannot send heartbeat, returning");
+        return;
+    }
+
+    info!("Sending heartbeat");
+    let append_entry_req = node_guard.append_entries();
+    let serialized_request = serde_json::to_string(&append_entry_req).unwrap() + "\n";
+    for peer in &node_guard.peers {
+        let response = match communicate_with_peer(peer, &serialized_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to communicate with peer: {}", e);
+                continue;
+            }
+        };
+
+        let append_entries_response: AppendEntryResponse = match serde_json::from_str(&response) {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to deserialize the response: {}", e);
+                continue;
+            }
+        };
+
+        if !append_entries_response.success
+            && append_entries_response.term > node_guard.current_term
+        {
+            info!("There is a new leader, stepping down");
+            node_guard.current_term = append_entries_response.term;
+            node_guard.state = State::Follower;
+            return;
+        }
+    }
+}
+
+async fn start_election(node: Arc<Mutex<Node>>) {
+    let mut node_guard = node.lock().await;
+    info!("Rechecking the conditions before starting the election");
+    if node_guard.state != State::Follower || node_guard.voted_for != None {
+        info!("Cannot run election for this node, returning");
+        return;
+    }
+    info!("Starting election");
+    node_guard.state = State::Candidate;
+    node_guard.current_term += 1;
+    node_guard.voted_for = Some(node_guard.id);
+
+    let vote_request = node_guard.request_vote();
+    let message = Message::RequestVote(vote_request);
+    let serialized_request = serde_json::to_string(&message).unwrap() + "\n";
+
+    let mut votes = 1;
+
+    for peer in &node_guard.peers {
+        let response = match communicate_with_peer(peer, &serialized_request).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to communicate with peer: {}", e);
+                continue;
+            }
+        };
+
+        let vote_response: RequestVoteResponse = match serde_json::from_str(&response) {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Failed to deserialize the response: {}", e);
+                continue;
+            }
+        };
+
+        info!("The response is: {:?}", vote_response);
+        if vote_response.term > node_guard.current_term {
+            info!("This node is not in the current term, update it and give up on leader election");
+            node_guard.current_term = vote_response.term;
+            break;
+        }
+
+        if vote_response.vote_granted {
+            votes += 1;
+        }
+    }
+
+    if votes <= node_guard.peers.len() / 2 {
+        node_guard.heartbeat_received();
+        node_guard.voted_for = None;
+        node_guard.current_term -= 1;
+        node_guard.state = State::Follower;
+        return;
+    }
+
+    node_guard.state = State::Leader;
+}
+
+async fn process_message(
     mut reader: BufReader<TcpStream>,
     node: Arc<Mutex<Node>>,
-) -> io::Result<()> {
+) -> Result<(), io::Error> {
     let mut line = String::new();
+    let mut node_guard = node.lock().await;
     while reader.read_line(&mut line).await? != 0 {
-        //  keep reading until EOF
-        let request_vote = match serde_json::from_str(&line.trim_end()) {
-            Ok(request) => request,
+        info!("The request is: {}", line);
+        match serde_json::from_str(&line.trim_end()) {
+            Ok(Message::RequestVote(request)) => {
+                let response = node_guard.handle_request_vote(request).await;
+                let serialized_response = serde_json::to_string(&response).unwrap() + "\n";
+                if let Err(e) = reader
+                    .get_mut()
+                    .write_all(serialized_response.as_bytes())
+                    .await
+                {
+                    error!("Failed to write the response back, {}", e);
+                }
+            }
+            Ok(Message::AppendEntry(request)) => {
+                let response = node_guard
+                    .handle_append_entries(
+                        request.term,
+                        request.leader_id,
+                        0,
+                        0,
+                        request.entries,
+                        request.leader_commit,
+                    )
+                    .await;
+                let serialized_response = serde_json::to_string(&response).unwrap() + "\n";
+                if let Err(e) = reader
+                    .get_mut()
+                    .write_all(serialized_response.as_bytes())
+                    .await
+                {
+                    error!("Failed to write the response back, {}", e);
+                }
+            }
+
             Err(e) => {
                 error!("Failed to process the request {}", e);
                 continue;
             }
-        };
-        let mut node_guard = node.lock().await;
-        let response = node_guard.handle_request_vote(request_vote).await;
-        let serialized_response = serde_json::to_string(&response).unwrap() + "\n";
-        if let Err(e) = reader
-            .get_mut()
-            .write_all(serialized_response.as_bytes())
-            .await
-        {
-            error!("Failed to write response back: {}", e);
         }
-        line.clear();
     }
     Ok(())
 }
@@ -255,7 +359,7 @@ async fn listen_for_messages(node: Arc<Mutex<Node>>) -> io::Result<()> {
 
         //  spawn a separate thread to process the request
         tokio::spawn(async move {
-            if let Err(e) = process_connection(reader, node_clone).await {
+            if let Err(e) = process_message(reader, node_clone).await {
                 error!("Error processing connection {}", e);
             }
         });
@@ -295,7 +399,9 @@ async fn main() {
 
     //  main loop
     loop {
-        let mut node_guard = node.lock().await;
+        let node_clone = node.clone();
+        let node_clone_for_heartbeat = node.clone();
+        let node_guard = node.lock().await;
         //  start an election only if the following conditions are met:
         // 1. The node is a follower
         // 2. The election timeout has elapsed
@@ -304,10 +410,19 @@ async fn main() {
             && node_guard.election_timeout_elapsed(node_guard.election_timeout)
             && node_guard.voted_for == None
         {
-            //  start an election
-            node_guard.start_election().await;
+            drop(node_guard);
+            start_election(node_clone).await;
+            let node_guard = node.lock().await;
+            if node_guard.state == State::Leader {
+                drop(node_guard);
+                tokio::spawn(async move {
+                    run_heartbeat_mechanism(node_clone_for_heartbeat).await;
+                });
+            }
+        } else {
+            drop(node_guard);
         }
-        drop(node_guard);
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -328,7 +443,7 @@ fn initialize_cluster(ports: Vec<u32>) -> Vec<Arc<Mutex<Node>>> {
         )));
         nodes.push(node);
     }
-    return nodes;
+    nodes
 }
 
 #[tokio::test]
@@ -348,13 +463,8 @@ async fn test_leader_election() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     //  trigger an election on one of the nodes
-    {
-        let mut node_guard = nodes[0].lock().await;
-        node_guard.start_election().await;
-    }
+    start_election(Arc::clone(&nodes[0])).await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    info!("acq node guard");
     let node_guard = nodes[0].lock().await;
     assert!(node_guard.state == State::Leader);
 }
