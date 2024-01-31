@@ -1,6 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde_json;
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
@@ -49,61 +49,66 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         }
     }
 
-    fn process_message(&self, reader: BufReader<TcpStream>) -> Result<(), io::Error> {
-        for line in reader.lines() {
-            let json = line?;
-            let rpc: RPCMessage<T> = serde_json::from_str(&json)?;
-            match self.to_node_sender.send(rpc) {
-                Ok(_) => (),
+    fn start(&self) {
+        let server_address = self.server_address.clone();
+        let server_id = self.server_id.clone();
+        let to_node_sender = self.to_node_sender.clone();
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(&server_address) {
+                Ok(tcp_listener) => tcp_listener,
                 Err(e) => {
-                    error!(
-                        "There was an error while sending the rpc message to the node {}",
-                        e
-                    );
                     panic!(
-                        "There was an error while sending the rpc message to the node {}",
-                        e
+                        "There was an error while binding to the address {} for server id {} {}",
+                        server_address, server_id, e
                     );
                 }
-            }
-        }
-        Ok(())
-    }
+            };
 
-    fn start(&self) {
-        let listener = match TcpListener::bind(&self.server_address) {
-            Ok(tcp_listener) => tcp_listener,
-            Err(e) => {
-                error!(
-                    "There was an error while binding to the address {} for server id {} {}",
-                    self.server_address, self.server_id, e
-                );
-                panic!(
-                    "There was an error while binding to the address {} for server id {} {}",
-                    self.server_address, self.server_id, e
-                );
-            }
-        };
-
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let reader = BufReader::new(stream);
-                    match self.process_message(reader) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("There was an error while processing the message {}", e);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let reader = BufReader::new(stream);
+                        for line in reader.lines() {
+                            let json = match line {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    panic!("There was an error while reading the line {}", e);
+                                }
+                            };
+                            let rpc: RPCMessage<T> = match serde_json::from_str(&json) {
+                                Ok(message) => message,
+                                Err(e) => {
+                                    panic!(
+                                        "There was an error while deserializing the message {}",
+                                        e
+                                    );
+                                }
+                            };
+                            match to_node_sender.send(rpc) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    panic!(
+                                        "There was an error while sending the rpc message to the node {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    error!("There was an error while accepting a connection {}", e);
+                    Err(e) => {
+                        error!("There was an error while accepting a connection {}", e);
+                    }
                 }
             }
-        }
+        });
     }
 
+    /**
+     * This method is called from the raft node to allow it to communicate with other nodes
+     * via the RPC manager.
+     */
     fn send_message(
+        &self,
         from_server_id: ServerId,
         to_server_id: ServerId,
         to_address: String,
@@ -240,10 +245,7 @@ struct RaftNodeState<T: Serialize + DeserializeOwned + Clone> {
     votes_received: HashMap<ServerId, bool>,
 }
 
-struct RaftNode<
-    T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone,
-    S: StateMachine<T>,
-> {
+struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>> {
     id: ServerId,
     state: Mutex<RaftNodeState<T>>,
     state_machine: S,
@@ -251,13 +253,10 @@ struct RaftNode<
     peers: Vec<ServerId>,
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
     from_rpc_receiver: mpsc::Receiver<RPCMessage<T>>,
+    rpc_manager: RPCManager<T>,
 }
 
-impl<
-        T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone,
-        S: StateMachine<T>,
-    > RaftNode<T, S>
-{
+impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
     /**
     * BecomeLeader(i) ==
        /\ state[i] = Candidate
@@ -544,9 +543,151 @@ impl<
         };
     }
 
+    fn handle_append_entries_response(&self, response: AppendEntriesResponse) {
+        let mut state_guard = self.state.lock().unwrap();
+        if state_guard.current_term < response.term && !response.success {
+            return;
+        }
+
+        let server_index = response.server_id as usize;
+
+        if !response.success {
+            //  check if the response term is greater - if it is, step down as leader
+            if state_guard.current_term < response.term {
+                self.update_term(&mut state_guard, response.term);
+            }
+
+            state_guard.next_index[server_index] = state_guard.next_index[server_index]
+                .saturating_sub(1)
+                .max(1);
+
+            self.retry_append_request(&state_guard, server_index, response.server_id);
+            return;
+        }
+
+        //  the response is successful
+        state_guard.next_index[response.server_id as usize] = response.match_index + 1;
+        state_guard.match_index[response.server_id as usize] = response.match_index;
+        self.advance_commit_index(&mut state_guard);
+        return;
+    }
+
+    /**
+     * Utility functions for main RPC's
+     * All these functions expect a MutexGuard to be passed in to them
+     */
+    fn update_term(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>, new_term: Term) {
+        assert!(state_guard.status == RaftNodeStatus::Leader);
+        state_guard.current_term = new_term;
+        state_guard.voted_for = None;
+        state_guard.status = RaftNodeStatus::Follower;
+        return;
+    }
+
+    fn retry_append_request(
+        &self,
+        state_guard: &MutexGuard<'_, RaftNodeState<T>>,
+        server_index: usize,
+        to_server_id: u64,
+    ) {
+        let next_log_index = state_guard.next_index[server_index] as usize;
+        let entries_to_send: Vec<LogEntry<T>> = if next_log_index < state_guard.log.len() {
+            state_guard.log[(next_log_index - 1) as usize..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let prev_log_index = if next_log_index > 1 {
+            (next_log_index - 1) as u64
+        } else {
+            0
+        };
+        let prev_log_term = if next_log_index > 1 {
+            state_guard.log[next_log_index - 1].term
+        } else {
+            0
+        };
+
+        let request = AppendEntriesRequest {
+            term: state_guard.current_term,
+            leader_id: self.id,
+            prev_log_index,
+            prev_log_term,
+            entries: entries_to_send,
+            leader_commit_index: state_guard.commit_index,
+        };
+        let message = RPCMessage::<T>::AppendEntriesRequest(request);
+        let to_address = self
+            .config
+            .id_to_address_mapping
+            .get(&to_server_id)
+            .unwrap();
+        self.rpc_manager
+            .send_message(self.id, to_server_id, to_address.clone(), message);
+    }
+
+    /**
+    * \* Leader i advances its commitIndex.
+       \* This is done as a separate step from handling AppendEntries responses,
+       \* in part to minimize atomic regions, and in part so that leaders of
+       \* single-server clusters are able to mark entries committed.
+       AdvanceCommitIndex(i) ==
+           /\ state[i] = Leader
+           /\ LET \* The set of servers that agree up through index.
+               Agree(index) == {i} \cup {k \in Server :
+                                               matchIndex[i][k] >= index}
+               \* The maximum indexes for which a quorum agrees
+               agreeIndexes == {index \in 1..Len(log[i]) :
+                                       Agree(index) \in Quorum}
+               \* New value for commitIndex'[i]
+               newCommitIndex ==
+                   IF /\ agreeIndexes /= {}
+                       /\ log[i][Max(agreeIndexes)].term = currentTerm[i]
+                   THEN
+                       Max(agreeIndexes)
+                   ELSE
+                       commitIndex[i]
+           IN commitIndex' = [commitIndex EXCEPT ![i] = newCommitIndex]
+           /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log>>
+        */
+    fn advance_commit_index(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        assert!(state_guard.status == RaftNodeStatus::Leader);
+
+        //  find all match indexes that have quorum
+        let mut match_index_count: HashMap<u64, u64> = HashMap::new();
+        for &server_match_index in &state_guard.match_index {
+            *match_index_count.entry(server_match_index).or_insert(0) += 1;
+        }
+
+        let new_commit_index = match_index_count
+            .iter()
+            .filter(|(&index, &count)| {
+                count >= self.quorum_size().try_into().unwrap()
+                    && state_guard
+                        .log
+                        .get((index - 1) as usize)
+                        .map_or(false, |entry| entry.term == state_guard.current_term)
+            })
+            .map(|(&match_index, _)| match_index)
+            .max();
+
+        if let Some(max_index) = new_commit_index {
+            state_guard.commit_index = max_index;
+        }
+    }
+    /**
+     * End utility functions for main RPC's
+     */
+
     /**
      * Helper functions
      */
+
+    //  The quorum size is (N/2) + 1, where N = number of servers in the cluster
+    fn quorum_size(&self) -> usize {
+        (self.config.cluster_nodes.len() / 2) + 1
+    }
+
     fn len_as_u64(&self, v: &Vec<LogEntry<T>>) -> u64 {
         v.len() as u64
     }
@@ -557,7 +698,13 @@ impl<
 
     //  From this point onward, are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
-    fn new(id: ServerId, state_machine: S, config: ServerConfig, peers: Vec<ServerId>) -> Self {
+    fn new(
+        &self,
+        id: ServerId,
+        state_machine: S,
+        config: ServerConfig,
+        peers: Vec<ServerId>,
+    ) -> Self {
         let election_jitter = rand::thread_rng().gen_range(0..100);
         let election_timeout = config.election_timeout + Duration::from_millis(election_jitter);
         let server_state = RaftNodeState {
@@ -573,6 +720,12 @@ impl<
             match_index: Vec::new(),
         };
         let (to_node_sender, from_rpc_receiver) = mpsc::channel();
+        let rpc_manager = RPCManager::new(
+            self.id,
+            self.config.address.clone(),
+            self.config.port,
+            self.to_node_sender.clone(),
+        );
         let server = RaftNode {
             id,
             state: Mutex::new(server_state),
@@ -581,23 +734,10 @@ impl<
             peers,
             to_node_sender,
             from_rpc_receiver,
+            rpc_manager,
         };
         info!("Initialising a new raft server with id {}", id);
         server
-    }
-
-    fn start(&self) {
-        //  start the rpc manager here
-        let rpc_manager = RPCManager::new(
-            self.id,
-            self.config.address.clone(),
-            self.config.port,
-            self.to_node_sender.clone(),
-        );
-        thread::spawn(move || {
-            rpc_manager.start();
-        });
-        self.listen_for_messages();
     }
 
     fn listen_for_messages(&self) {
@@ -612,7 +752,7 @@ impl<
                         .id_to_address_mapping
                         .get(&vote_request.candidate_id)
                         .expect("Cannot find the id to address mapping");
-                    RPCManager::send_message(
+                    self.rpc_manager.send_message(
                         self.id,
                         vote_response.candidate_id,
                         to_address.clone(),
@@ -637,6 +777,11 @@ impl<
                 }
             }
         }
+    }
+
+    fn start(&self) {
+        self.rpc_manager.start();
+        self.listen_for_messages();
     }
 }
 
