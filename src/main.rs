@@ -1,6 +1,8 @@
 use serde::de::DeserializeOwned;
 use serde_json;
+use std::cell::RefCell;
 use std::cmp::{max, min};
+use std::fmt::format;
 use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
@@ -197,9 +199,9 @@ struct ServerConfig {
 }
 
 trait StateMachine<T: Serialize + DeserializeOwned + Clone> {
-    fn apply_set(&mut self, key: String, value: T);
-    fn apply_get(&mut self, key: String) -> Option<&T>;
-    fn apply(&mut self, entries: Vec<LogEntry<T>>);
+    fn apply_set(&self, key: String, value: T);
+    fn apply_get(&self, key: String) -> Option<T>;
+    fn apply(&self, entries: Vec<LogEntry<T>>);
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -422,7 +424,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
 
     fn handle_append_entries_request(
         &self,
-        request: AppendEntriesRequest<T>,
+        request: &AppendEntriesRequest<T>,
     ) -> AppendEntriesResponse {
         let mut state_guard = self.state.lock().unwrap();
 
@@ -569,6 +571,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
         state_guard.next_index[response.server_id as usize] = response.match_index + 1;
         state_guard.match_index[response.server_id as usize] = response.match_index;
         self.advance_commit_index(&mut state_guard);
+        self.apply_entries(&mut state_guard);
         return;
     }
 
@@ -675,6 +678,25 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
             state_guard.commit_index = max_index;
         }
     }
+
+    /**
+     * This function will move the last_applied to make it catch up with commit_index and apply all the entries in that range
+     * to the state machine
+     */
+    fn apply_entries(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        assert!(state_guard.status == RaftNodeStatus::Leader);
+        let mut entries_to_apply: Vec<LogEntry<T>> = Vec::new();
+        while state_guard.last_applied < state_guard.commit_index {
+            state_guard.last_applied += 1;
+            let entry_at_index = state_guard
+                .log
+                .get((state_guard.last_applied - 1) as usize)
+                .unwrap();
+            entries_to_apply.push(entry_at_index.clone());
+        }
+
+        self.state_machine.apply(entries_to_apply);
+    }
     /**
      * End utility functions for main RPC's
      */
@@ -696,7 +718,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
      * End helper functions
      */
 
-    //  From this point onward, are all the starter methods to bring the node up and handle communication
+    //  From this point onward are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
     fn new(
         &self,
@@ -751,10 +773,16 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
                         .config
                         .id_to_address_mapping
                         .get(&vote_request.candidate_id)
-                        .expect("Cannot find the id to address mapping");
+                        .expect(
+                            format!(
+                                "Cannot find the id to address mapping for candidate id {}",
+                                vote_request.candidate_id
+                            )
+                            .as_str(),
+                        );
                     self.rpc_manager.send_message(
                         self.id,
-                        vote_response.candidate_id,
+                        vote_request.candidate_id,
                         to_address.clone(),
                         RPCMessage::<T>::VoteResponse(vote_response),
                     );
@@ -768,12 +796,32 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
                         "Received an append entries request {:?}",
                         append_entries_request
                     );
+                    let response = self.handle_append_entries_request(&append_entries_request);
+                    info!("Sending an append entries response {:?}", response);
+                    let to_address = self
+                        .config
+                        .id_to_address_mapping
+                        .get(&append_entries_request.leader_id)
+                        .expect(
+                            format!(
+                                "Cannot find the id to address mapping for leader id {}",
+                                append_entries_request.leader_id
+                            )
+                            .as_str(),
+                        );
+                    self.rpc_manager.send_message(
+                        self.id,
+                        append_entries_request.leader_id,
+                        to_address.clone(),
+                        RPCMessage::<T>::AppendEntriesResponse(response),
+                    );
                 }
                 RPCMessage::AppendEntriesResponse(append_entries_response) => {
                     info!(
                         "Received an append entries response {:?}",
                         append_entries_response
                     );
+                    self.handle_append_entries_response(append_entries_response);
                 }
             }
         }
@@ -789,23 +837,21 @@ fn main() {}
 
 //  An example state machine - a key value store
 struct KeyValueStore<T> {
-    store: HashMap<String, T>,
+    store: RefCell<HashMap<String, T>>,
 }
 
-impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone> StateMachine<T>
-    for KeyValueStore<T>
-{
-    fn apply_set(&mut self, key: String, value: T) {
-        self.store.insert(key, value);
+impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
+    fn apply_set(&self, key: String, value: T) {
+        self.store.borrow_mut().insert(key, value);
     }
 
-    fn apply_get(&mut self, key: String) -> Option<&T> {
-        return self.store.get(&key);
+    fn apply_get(&self, key: String) -> Option<T> {
+        return self.store.borrow().get(&key).cloned();
     }
 
-    fn apply(&mut self, entries: Vec<LogEntry<T>>) {
+    fn apply(&self, entries: Vec<LogEntry<T>>) {
         for entry in entries {
-            self.store.insert(entry.key, entry.value);
+            self.store.borrow_mut().insert(entry.key, entry.value);
         }
     }
 }
