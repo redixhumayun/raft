@@ -1,12 +1,14 @@
 use serde::de::DeserializeOwned;
 use serde_json;
+use std::cmp::min;
 use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use std::{collections::HashMap, io::BufReader};
+use types::RaftTypeTrait;
 
 use log::{error, info};
 use rand::Rng;
@@ -23,7 +25,7 @@ use crate::types::{ServerId, Term};
  * RPC Stuff
  */
 
-struct RPCManager<T: DeserializeOwned> {
+struct RPCManager<T: RaftTypeTrait> {
     server_id: ServerId,
     server_address: String,
     port: u64,
@@ -31,7 +33,7 @@ struct RPCManager<T: DeserializeOwned> {
     _marker: PhantomData<T>,
 }
 
-impl<T: Serialize + DeserializeOwned> RPCManager<T> {
+impl<T: RaftTypeTrait> RPCManager<T> {
     fn new(
         server_id: ServerId,
         server_address: String,
@@ -137,7 +139,7 @@ impl<T: Serialize + DeserializeOwned> RPCManager<T> {
 }
 
 #[derive(Serialize, Deserialize)]
-enum RPCMessage<T> {
+enum RPCMessage<T: Clone> {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
     AppendEntriesRequest(AppendEntriesRequest<T>),
@@ -159,7 +161,7 @@ struct VoteResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct AppendEntriesRequest<T> {
+struct AppendEntriesRequest<T: Clone> {
     term: Term,
     leader_id: ServerId,
     prev_log_index: u64,
@@ -170,8 +172,10 @@ struct AppendEntriesRequest<T> {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AppendEntriesResponse {
+    server_id: ServerId,
     term: Term,
     success: bool,
+    match_index: u64,
 }
 
 /**
@@ -183,22 +187,24 @@ struct ServerConfig {
     heartbeat_interval: Duration,
     address: String,
     port: u64,
+    cluster_nodes: Vec<u64>,
+    id_to_address_mapping: HashMap<ServerId, String>,
 }
 
-trait StateMachine<T> {
+trait StateMachine<T: Serialize + DeserializeOwned + Clone> {
     fn apply_set(&mut self, key: String, value: T);
     fn apply_get(&mut self, key: String) -> Option<&T>;
     fn apply(&mut self, entries: Vec<LogEntry<T>>);
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum LogEntryCommand {
     Set = 0,
     Delete = 1,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct LogEntry<T> {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct LogEntry<T: Clone> {
     term: Term,
     index: u64,
     command: LogEntryCommand,
@@ -213,7 +219,7 @@ enum RaftNodeStatus {
     Follower,
 }
 
-struct RaftNodeState<T> {
+struct RaftNodeState<T: Serialize + DeserializeOwned + Clone> {
     //  persistent state on all servers
     current_term: Term,
     voted_for: Option<ServerId>,
@@ -234,19 +240,53 @@ struct RaftNodeState<T> {
     votes_received: HashMap<ServerId, bool>,
 }
 
-struct RaftNode<T: DeserializeOwned + Send + 'static + std::fmt::Debug, S: StateMachine<T>> {
+struct RaftNode<
+    T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone,
+    S: StateMachine<T>,
+> {
     id: ServerId,
     state: Mutex<RaftNodeState<T>>,
     state_machine: S,
     config: ServerConfig,
     peers: Vec<ServerId>,
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
-    from_rpc_receiver: Arc<Mutex<mpsc::Receiver<RPCMessage<T>>>>,
+    from_rpc_receiver: mpsc::Receiver<RPCMessage<T>>,
 }
 
-impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: StateMachine<T>>
-    RaftNode<T, S>
+impl<
+        T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone,
+        S: StateMachine<T>,
+    > RaftNode<T, S>
 {
+    /**
+    * BecomeLeader(i) ==
+       /\ state[i] = Candidate
+       /\ votesGranted[i] \in Quorum
+       /\ state'      = [state EXCEPT ![i] = Leader]
+       /\ nextIndex'  = [nextIndex EXCEPT ![i] =
+                           [j \in Server |-> Len(log[i]) + 1]]
+       /\ matchIndex' = [matchIndex EXCEPT ![i] =
+                           [j \in Server |-> 0]]
+       /\ elections'  = elections \cup
+                           {[eterm     |-> currentTerm[i],
+                           eleader   |-> i,
+                           elog      |-> log[i],
+                           evotes    |-> votesGranted[i],
+                           evoterLog |-> voterLog[i]]}
+       /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
+    */
+    fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
+        state_guard.status = RaftNodeStatus::Leader;
+        let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
+        state_guard.next_index = self
+            .config
+            .cluster_nodes
+            .iter()
+            .map(|_| last_log_index + 1)
+            .collect();
+        state_guard.match_index = vec![0; self.config.cluster_nodes.len()];
+    }
+
     /**
          * \* Message handlers
     \* i = recipient, j = sender, m = message
@@ -274,7 +314,7 @@ impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: Stat
                      m)
            /\ UNCHANGED <<state, currentTerm, candidateVars, leaderVars, logVars>>
          */
-    fn handle_vote_request(&self, request: VoteRequest) -> VoteResponse {
+    fn handle_vote_request(&self, request: &VoteRequest) -> VoteResponse {
         let mut state_guard = self.state.lock().unwrap();
 
         if state_guard.status == RaftNodeStatus::Leader {
@@ -348,6 +388,10 @@ impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: Stat
     fn handle_vote_response(&self, vote_response: VoteResponse) {
         let mut state_guard = self.state.lock().unwrap();
 
+        if state_guard.status != RaftNodeStatus::Candidate {
+            return;
+        }
+
         if !vote_response.vote_granted && vote_response.term > state_guard.current_term {
             //  the term is different, update term and downgrade to follower
             state_guard.current_term = vote_response.term;
@@ -373,8 +417,143 @@ impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: Stat
 
         if sum_of_votes_granted == quorum {
             //  the candidate should become a leader
+            self.become_leader(state_guard);
         }
     }
+
+    fn handle_append_entries_request(
+        &self,
+        request: AppendEntriesRequest<T>,
+    ) -> AppendEntriesResponse {
+        let mut state_guard = self.state.lock().unwrap();
+
+        //  the term check
+        if request.term < state_guard.current_term && state_guard.status == RaftNodeStatus::Follower
+        {
+            return AppendEntriesResponse {
+                server_id: self.id,
+                term: state_guard.current_term,
+                success: false,
+                match_index: 0,
+            };
+        }
+
+        // the log check
+        let prev_log_term_for_this_node = state_guard
+            .log
+            .get(request.prev_log_index as usize)
+            .map_or(0, |entry| entry.term);
+        let log_ok = request.prev_log_index == 0
+            || (request.prev_log_index > 0
+                && request.prev_log_index <= state_guard.log.len() as u64
+                && request.prev_log_term == prev_log_term_for_this_node);
+
+        if !log_ok {
+            return AppendEntriesResponse {
+                server_id: self.id,
+                term: state_guard.current_term,
+                success: false,
+                match_index: 0,
+            };
+        }
+
+        //  the candidate check - revert to follower if true
+        if request.term == state_guard.current_term
+            && state_guard.status == RaftNodeStatus::Candidate
+        {
+            state_guard.status = RaftNodeStatus::Follower;
+        }
+
+        if request.entries.len() == 0 {
+            //  this is a heartbeat request
+            return AppendEntriesResponse {
+                server_id: self.id,
+                term: state_guard.current_term,
+                success: true,
+                match_index: 0, //  TODO: Fix this
+            };
+        }
+
+        //  the request can be accepted, try and append the logs
+        //  this is the point where the logs will be inserted
+        let log_index = request.prev_log_index + 1; //  the first log index will be 1
+
+        //  Now, we know the prefix is ok. First, check that there are no subsequent logs on the follower.
+        //  If there are subequent logs, and there is a conflict, discard logs from the conflict point onwards
+        if (state_guard.log.len() as u64) > log_index {
+            let max_range = min(
+                self.len_as_u64(&state_guard.log) - log_index,
+                self.len_as_u64(&request.entries),
+            );
+            let mut conflict_point = -1;
+
+            //  Check if a conflict point exists
+            for index in 0..max_range {
+                let follower_entry = state_guard
+                    .log
+                    .get((log_index - 1 + index) as usize)
+                    .expect(&format!(
+                        "There is no entry at index for the follower {}",
+                        log_index - 1 + index
+                    ));
+
+                let message_entry = request
+                    .entries
+                    .get((log_index - 1 + index) as usize)
+                    .expect(&format!(
+                        "There is no entry at index {} in the message",
+                        log_index - 1 + index
+                    ));
+
+                if follower_entry.term != message_entry.term {
+                    conflict_point = (log_index - 1 + index) as i64;
+                    break;
+                }
+            }
+
+            if conflict_point != -1 {
+                state_guard.log.truncate(conflict_point as usize);
+            }
+
+            //  Now, start appending logs from the conflict point onwards
+            let entries_to_insert = &request.entries[(conflict_point as usize)..];
+            state_guard.log.extend_from_slice(entries_to_insert);
+            if request.leader_commit_index > state_guard.commit_index {
+                state_guard.commit_index = min(
+                    request.leader_commit_index,
+                    self.len_as_u64(&state_guard.log),
+                );
+            }
+            return AppendEntriesResponse {
+                server_id: self.id,
+                term: state_guard.current_term,
+                success: true,
+                match_index: request.prev_log_index + self.len_as_u64(&request.entries), //  the last known log to be committed
+            };
+        }
+
+        //  There are no subsequent logs on the follower, so no possibility of conflicts. Which means the logs can just be appended
+        //  and the response can be returned
+        state_guard.log.append(&mut request.entries.clone());
+
+        return AppendEntriesResponse {
+            server_id: self.id,
+            term: state_guard.current_term,
+            success: true,
+            match_index: request.prev_log_index + self.len_as_u64(&request.entries), //  TODO: Fix this
+        };
+    }
+
+    /**
+     * Helper functions
+     */
+    fn len_as_u64(&self, v: &Vec<LogEntry<T>>) -> u64 {
+        v.len() as u64
+    }
+
+    /**
+     * End helper functions
+     */
 
     //  From this point onward, are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
@@ -401,7 +580,7 @@ impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: Stat
             config,
             peers,
             to_node_sender,
-            from_rpc_receiver: Arc::new(Mutex::new(from_rpc_receiver)),
+            from_rpc_receiver,
         };
         info!("Initialising a new raft server with id {}", id);
         server
@@ -422,32 +601,42 @@ impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug, S: Stat
     }
 
     fn listen_for_messages(&self) {
-        let receiver = Arc::clone(&self.from_rpc_receiver);
-        thread::spawn(move || {
-            let receiver_guard = receiver.lock().unwrap();
-            for message in receiver_guard.iter() {
-                match message {
-                    RPCMessage::VoteRequest(vote_request) => {
-                        info!("Received a vote request {:?}", vote_request);
-                    }
-                    RPCMessage::VoteResponse(vote_response) => {
-                        info!("Received a vote response {:?}", vote_response);
-                    }
-                    RPCMessage::AppendEntriesRequest(append_entries_request) => {
-                        info!(
-                            "Received an append entries request {:?}",
-                            append_entries_request
-                        );
-                    }
-                    RPCMessage::AppendEntriesResponse(append_entries_response) => {
-                        info!(
-                            "Received an append entries response {:?}",
-                            append_entries_response
-                        );
-                    }
+        for message in self.from_rpc_receiver.iter() {
+            match message {
+                RPCMessage::VoteRequest(vote_request) => {
+                    info!("Received a vote request {:?}", vote_request);
+                    let vote_response = self.handle_vote_request(&vote_request);
+                    info!("Sending a vote response {:?}", vote_response);
+                    let to_address = self
+                        .config
+                        .id_to_address_mapping
+                        .get(&vote_request.candidate_id)
+                        .expect("Cannot find the id to address mapping");
+                    RPCManager::send_message(
+                        self.id,
+                        vote_response.candidate_id,
+                        to_address.clone(),
+                        RPCMessage::<T>::VoteResponse(vote_response),
+                    );
+                }
+                RPCMessage::VoteResponse(vote_response) => {
+                    info!("Received a vote response {:?}", vote_response);
+                    self.handle_vote_response(vote_response);
+                }
+                RPCMessage::AppendEntriesRequest(append_entries_request) => {
+                    info!(
+                        "Received an append entries request {:?}",
+                        append_entries_request
+                    );
+                }
+                RPCMessage::AppendEntriesResponse(append_entries_response) => {
+                    info!(
+                        "Received an append entries response {:?}",
+                        append_entries_response
+                    );
                 }
             }
-        });
+        }
     }
 }
 
@@ -458,7 +647,9 @@ struct KeyValueStore<T> {
     store: HashMap<String, T>,
 }
 
-impl<T> StateMachine<T> for KeyValueStore<T> {
+impl<T: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug + Clone> StateMachine<T>
+    for KeyValueStore<T>
+{
     fn apply_set(&mut self, key: String, value: T) {
         self.store.insert(key, value);
     }
