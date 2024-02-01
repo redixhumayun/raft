@@ -1,12 +1,13 @@
+use core::fmt;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::cell::RefCell;
-use std::cmp::{max, min};
-use std::fmt::format;
+use std::cmp::min;
 use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::str::FromStr;
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use std::{collections::HashMap, io::BufReader};
@@ -16,12 +17,11 @@ use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+mod storage;
 mod types;
 
 use crate::types::{ServerId, Term};
-
-// pub trait RaftDataType: DeserializeOwned + Send + 'static {}
-// impl<T: DeserializeOwned + Send + 'static> RaftDataType for T {}
+use storage::DirectFileOps;
 
 /**
  * RPC Stuff
@@ -208,6 +208,34 @@ trait StateMachine<T: Serialize + DeserializeOwned + Clone> {
 enum LogEntryCommand {
     Set = 0,
     Delete = 1,
+}
+
+impl FromStr for LogEntryCommand {
+    type Err = io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v: u64 = s
+            .trim()
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        match v {
+            0 => Ok(LogEntryCommand::Set),
+            1 => Ok(LogEntryCommand::Delete),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid log entry command",
+            )),
+        }
+    }
+}
+
+impl fmt::Display for LogEntryCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogEntryCommand::Set => write!(f, "0"),
+            LogEntryCommand::Delete => write!(f, "1"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
