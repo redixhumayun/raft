@@ -5,6 +5,8 @@ use std::{
     str::FromStr,
 };
 
+use log::info;
+
 use crate::{
     types::{ServerId, Term},
     LogEntry, LogEntryCommand,
@@ -86,9 +88,9 @@ where
 {
     fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error> {
         let file = self.file.as_mut().expect("File not found");
+        file.seek(SeekFrom::Start(0))?;
         let mut buf_reader = BufReader::new(file);
         let mut line = String::new();
-        buf_reader.read_line(&mut line)?;
         let mut entries: Vec<LogEntry<T>> = Vec::new();
         for _ in 0..log_index {
             if buf_reader.read_line(&mut line)? == 0 {
@@ -106,14 +108,15 @@ where
             let term: Term = values[0].trim().parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Invalid term: {}", e))
             })?;
-            let index: u64 = values[1]
-                .trim()
-                .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let command: LogEntryCommand = values[2]
-                .trim()
-                .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let index: u64 = values[1].trim().parse().map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("Invalid index: {}", e))
+            })?;
+            let command: LogEntryCommand = values[2].trim().parse().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid command: {}", e),
+                )
+            })?;
             let key: String = values[3].trim().to_string();
             let value: T = values[4].trim().parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Invalid value: {}", e))
@@ -139,6 +142,7 @@ where
                 entry.term, entry.index, entry.command, entry.key, entry.value
             )?;
         }
+        file.flush()?;
         Ok(())
     }
 }
@@ -162,27 +166,120 @@ impl std::str::FromStr for TestEntryData {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use super::*;
+    use std::{
+        fs::remove_file,
+        io::{self, Read},
+    };
 
     use log::debug;
 
-    use super::*;
-    use super::{BaseFileOps, DirectFileOps, GenericFileOps};
+    use crate::{LogEntry, LogEntryCommand};
+
+    use super::{BaseFileOps, DirectFileOps, GenericFileOps, TestEntryData};
 
     #[test]
-    fn test_term_and_voted_for_read_and_write() -> Result<(), io::Error> {
+    fn test_term_and_voted_for_write_and_read() -> Result<(), io::Error> {
+        info!("Starting test_term_and_voted_for_write_and_read");
+        let _ = env_logger::try_init();
         let temp_file = "temp_file";
         let mut ops = DirectFileOps::new(temp_file, 0)?;
         ops.write_term_and_voted_for(1, 2)?;
         let (term, voted_for) = ops.read_term_and_voted_for()?;
-        // debug!("{},{}", term, voted_for);
-        // assert_eq!(term, 1);
-        // assert_eq!(voted_for, 2);
+        debug!("{},{}", term, voted_for);
+        remove_file(format!("{}_server_{}", temp_file, 0))?;
+        assert_eq!(term, 1);
+        assert_eq!(voted_for, 2);
         Ok(())
     }
 
     #[test]
-    fn test_log_entries_read_and_write() -> Result<(), io::Error> {
+    fn dummy_test() -> Result<(), io::Error> {
+        info!("Starting dummy_test");
+        let _ = env_logger::try_init();
+        let temp_file = "temp_file";
+        let mut ops = DirectFileOps::new(temp_file, 0)?;
+        ops.write_term_and_voted_for(1, 2)?;
+
+        // Write a single log entry
+        let log_entry = LogEntry {
+            term: 1,
+            index: 1,
+            command: LogEntryCommand::Set,
+            key: "key".to_string(),
+            value: TestEntryData("value".to_string()),
+        };
+        ops.append_logs(&vec![log_entry])?;
+
+        // Flush and immediately read back the file content to inspect
+        let mut content = String::new();
+        ops.file.as_mut().unwrap().seek(SeekFrom::Start(0))?;
+        ops.file.as_mut().unwrap().read_to_string(&mut content)?;
+        println!("File content: {:?}", content);
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_entries_write_and_read() -> Result<(), io::Error> {
+        info!("Starting test_log_entries_write_and_read");
+        let _ = env_logger::try_init();
+        let temp_file = "temp_file";
+        let mut ops = DirectFileOps::new(temp_file, 0)?;
+        ops.write_term_and_voted_for(1, 2)?;
+
+        //  generate a bunch of log entries and write them
+        let mut log_entries: Vec<LogEntry<TestEntryData>> = Vec::new();
+        let mut log_index: u64 = 1;
+        for _ in 0..20 {
+            let log_entry: LogEntry<TestEntryData> = LogEntry {
+                term: 1,
+                index: log_index,
+                command: LogEntryCommand::Set,
+                key: log_index.to_string(),
+                value: TestEntryData(format!("value_{}", log_index)),
+            };
+            log_entries.push(log_entry);
+            log_index += 1;
+        }
+        ops.append_logs(&log_entries)?;
+
+        //  read your own writes here
+        let read_log_entries =
+            <DirectFileOps as GenericFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
+        remove_file(format!("{}_server_{}", temp_file, 0))?;
+        assert_eq!(log_entries.len(), read_log_entries.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_entries_write_and_read_from_offset() -> Result<(), io::Error> {
+        info!("Starting test_log_entries_write_and_read_from_offset");
+        let _ = env_logger::try_init();
+        let temp_file = "temp_file";
+        let mut ops = DirectFileOps::new(temp_file, 0)?;
+        ops.write_term_and_voted_for(1, 2)?;
+
+        //  generate a bunch of logs and write them
+        let mut log_entries: Vec<LogEntry<TestEntryData>> = Vec::new();
+        let mut log_index: u64 = 1;
+        for i in 0..100 {
+            let log_entry: LogEntry<TestEntryData> = LogEntry {
+                term: 1,
+                index: log_index,
+                command: LogEntryCommand::Set,
+                key: i.to_string(),
+                value: TestEntryData(format!("value_{}", i)),
+            };
+            log_entries.push(log_entry);
+            log_index += 1;
+        }
+        ops.append_logs(&log_entries)?;
+
+        //  reading your own writes from some offset here
+        let read_log_entries =
+            <DirectFileOps as GenericFileOps<TestEntryData>>::read_logs(&mut ops, 50)?;
+        remove_file(format!("{}_server_{}", temp_file, 0))?;
+        assert_eq!(log_entries.len() - 49, read_log_entries.len());
         Ok(())
     }
 }
