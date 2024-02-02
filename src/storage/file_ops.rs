@@ -5,6 +5,8 @@ use std::{
     str::FromStr,
 };
 
+use warp::Server;
+
 use crate::{
     types::{ServerId, Term},
     LogEntry, LogEntryCommand,
@@ -15,7 +17,7 @@ pub trait RaftFileOps<T: Clone + FromStr + Display> {
     fn write_term_and_voted_for(
         &mut self,
         term: Term,
-        voted_for: ServerId,
+        voted_for: Option<ServerId>,
     ) -> Result<(), io::Error>;
     fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error>;
     fn append_logs(&mut self, entries: &Vec<LogEntry<T>>) -> Result<(), io::Error>;
@@ -64,11 +66,15 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     fn write_term_and_voted_for(
         &mut self,
         term: Term,
-        voted_for: ServerId,
+        voted_for: Option<ServerId>,
     ) -> Result<(), io::Error> {
         let file = self.file.as_mut().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
-        writeln!(file, "{},{}", term, voted_for)?;
+        if let Some(v_f) = voted_for {
+            writeln!(file, "{},{}", term, v_f)?;
+        } else {
+            writeln!(file, "{},{}", term, -1)?;
+        }
         file.flush()?;
         Ok(())
     }
@@ -173,11 +179,12 @@ mod tests {
         let temp_file = "temp_file";
         let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
         <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-            &mut ops, 1, 2,
+            &mut ops,
+            1,
+            Option::Some(2),
         )?;
         let (term, voted_for) =
             <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_term_and_voted_for(&ops)?;
-        debug!("{},{}", term, voted_for);
         remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(term, 1);
         assert_eq!(voted_for, 2);
@@ -191,8 +198,10 @@ mod tests {
         let temp_file = "temp_file";
         let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
         <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-            &mut ops, 1, 2,
-        );
+            &mut ops,
+            1,
+            Option::Some(2),
+        )?;
 
         // Write a single log entry
         let log_entry = LogEntry {
@@ -219,7 +228,9 @@ mod tests {
         let temp_file = "temp_file";
         let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
         <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-            &mut ops, 1, 2,
+            &mut ops,
+            1,
+            Option::Some(2),
         )?;
 
         //  generate a bunch of log entries and write them
@@ -253,7 +264,9 @@ mod tests {
         let temp_file = "temp_file";
         let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
         <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-            &mut ops, 1, 2,
+            &mut ops,
+            1,
+            Option::Some(2),
         )?;
 
         //  generate a bunch of logs and write them

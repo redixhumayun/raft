@@ -8,9 +8,9 @@ use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::{mpsc, Mutex, MutexGuard};
-use std::thread;
 use std::time::Duration;
 use std::{collections::HashMap, io::BufReader};
+use std::{env, thread};
 use types::RaftTypeTrait;
 
 use log::{error, info};
@@ -289,35 +289,6 @@ struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> {
 
 impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> {
     /**
-    * BecomeLeader(i) ==
-       /\ state[i] = Candidate
-       /\ votesGranted[i] \in Quorum
-       /\ state'      = [state EXCEPT ![i] = Leader]
-       /\ nextIndex'  = [nextIndex EXCEPT ![i] =
-                           [j \in Server |-> Len(log[i]) + 1]]
-       /\ matchIndex' = [matchIndex EXCEPT ![i] =
-                           [j \in Server |-> 0]]
-       /\ elections'  = elections \cup
-                           {[eterm     |-> currentTerm[i],
-                           eleader   |-> i,
-                           elog      |-> log[i],
-                           evotes    |-> votesGranted[i],
-                           evoterLog |-> voterLog[i]]}
-       /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
-    */
-    fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
-        state_guard.status = RaftNodeStatus::Leader;
-        let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
-        state_guard.next_index = self
-            .config
-            .cluster_nodes
-            .iter()
-            .map(|_| last_log_index + 1)
-            .collect();
-        state_guard.match_index = vec![0; self.config.cluster_nodes.len()];
-    }
-
-    /**
          * \* Message handlers
     \* i = recipient, j = sender, m = message
 
@@ -344,7 +315,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
                      m)
            /\ UNCHANGED <<state, currentTerm, candidateVars, leaderVars, logVars>>
          */
-    fn handle_vote_request(&self, request: &VoteRequest) -> VoteResponse {
+    fn handle_vote_request(&mut self, request: &VoteRequest) -> VoteResponse {
         let mut state_guard = self.state.lock().unwrap();
 
         if state_guard.status == RaftNodeStatus::Leader {
@@ -389,6 +360,15 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
 
         //  all checks have passed - grant the vote but only after recording it. Also write it to disk
         state_guard.voted_for = Some(request.candidate_id);
+        match self
+            .persistence_manager
+            .write_term_and_voted_for(state_guard.current_term, state_guard.voted_for)
+        {
+            Ok(()) => (),
+            Err(e) => {
+                error!("There was a problem writing the term and voted_for variables to stable storage for node {}: {}", self.id, e);
+            }
+        }
         VoteResponse {
             term: state_guard.current_term,
             vote_granted: true,
@@ -415,7 +395,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         /\ Discard(m)
         /\ UNCHANGED <<serverVars, votedFor, leaderVars, logVars>>
          */
-    fn handle_vote_response(&self, vote_response: VoteResponse) {
+    fn handle_vote_response(&mut self, vote_response: VoteResponse) {
         let mut state_guard = self.state.lock().unwrap();
 
         if state_guard.status != RaftNodeStatus::Candidate {
@@ -423,9 +403,18 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         }
 
         if !vote_response.vote_granted && vote_response.term > state_guard.current_term {
-            //  the term is different, update term and downgrade to follower
+            //  the term is different, update term, downgrade to follower and persist to local storage
             state_guard.current_term = vote_response.term;
             state_guard.status = RaftNodeStatus::Follower;
+            match self
+                .persistence_manager
+                .write_term_and_voted_for(state_guard.current_term, Option::None)
+            {
+                Ok(()) => (),
+                Err(e) => {
+                    error!("There was a problem writing the term and voted_for variables to stable storage for node {}: {}", self.id, e);
+                }
+            }
             return;
         }
 
@@ -434,8 +423,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             return;
         }
 
-        //  the vote was granted - check if i achieved quorum
-        let quorum = self.peers.len() / 2;
+        //  the vote was granted - check if node achieved quorum
         state_guard
             .votes_received
             .insert(vote_response.candidate_id, vote_response.vote_granted);
@@ -445,7 +433,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             .filter(|(_, vote_granted)| **vote_granted)
             .count();
 
-        if sum_of_votes_granted == quorum {
+        if sum_of_votes_granted == self.quorum_size() {
             //  the candidate should become a leader
             self.become_leader(state_guard);
         }
@@ -605,9 +593,38 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
     }
 
     /**
-     * Utility functions for main RPC's
-     * All these functions expect a MutexGuard to be passed in to them
-     */
+                 * Utility functions for main RPC's
+                 * All these functions expect a MutexGuard to be passed in to them
+                 */
+    /**
+                * BecomeLeader(i) ==
+                   /\ state[i] = Candidate
+                   /\ votesGranted[i] \in Quorum
+                   /\ state'      = [state EXCEPT ![i] = Leader]
+                   /\ nextIndex'  = [nextIndex EXCEPT ![i] =
+                                       [j \in Server |-> Len(log[i]) + 1]]
+                   /\ matchIndex' = [matchIndex EXCEPT ![i] =
+                                       [j \in Server |-> 0]]
+                   /\ elections'  = elections \cup
+                                       {[eterm     |-> currentTerm[i],
+                                       eleader   |-> i,
+                                       elog      |-> log[i],
+                                       evotes    |-> votesGranted[i],
+                                       evoterLog |-> voterLog[i]]}
+                   /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
+                */
+    fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
+        state_guard.status = RaftNodeStatus::Leader;
+        let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
+        state_guard.next_index = self
+            .config
+            .cluster_nodes
+            .iter()
+            .map(|_| last_log_index + 1)
+            .collect();
+        state_guard.match_index = vec![0; self.config.cluster_nodes.len()];
+    }
+
     fn update_term(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>, new_term: Term) {
         assert!(state_guard.status == RaftNodeStatus::Leader);
         state_guard.current_term = new_term;
@@ -726,6 +743,48 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
 
         self.state_machine.apply(entries_to_apply);
     }
+
+    /**
+         * \* Server i restarts from stable storage.
+    \* It loses everything but its currentTerm, votedFor, and log.
+    Restart(i) ==
+        /\ state'          = [state EXCEPT ![i] = Follower]
+        /\ votesResponded' = [votesResponded EXCEPT ![i] = {}]
+        /\ votesGranted'   = [votesGranted EXCEPT ![i] = {}]
+        /\ voterLog'       = [voterLog EXCEPT ![i] = [j \in {} |-> <<>>]]
+        /\ nextIndex'      = [nextIndex EXCEPT ![i] = [j \in Server |-> 1]]
+        /\ matchIndex'     = [matchIndex EXCEPT ![i] = [j \in Server |-> 0]]
+        /\ commitIndex'    = [commitIndex EXCEPT ![i] = 0]
+        /\ UNCHANGED <<messages, currentTerm, votedFor, log, elections>>
+         */
+    fn restart(&mut self) {
+        let mut state_guard = self.state.lock().unwrap();
+        state_guard.status = RaftNodeStatus::Follower;
+        state_guard.next_index = vec![1; self.config.cluster_nodes.len()];
+        state_guard.match_index = vec![0; self.config.cluster_nodes.len()];
+        state_guard.commit_index = 0;
+        state_guard.votes_received = HashMap::new();
+
+        let (term, voted_for) = match self.persistence_manager.read_term_and_voted_for() {
+            Ok((t, v)) => (t, v),
+            Err(e) => {
+                panic!(
+                    "There was an error while reading the term and voted for {}",
+                    e
+                );
+            }
+        };
+        state_guard.current_term = term;
+        state_guard.voted_for = Some(voted_for);
+
+        let log_entries = match self.persistence_manager.read_logs(1) {
+            Ok(entries) => entries,
+            Err(e) => {
+                panic!("There was an error while reading the logs {}", e);
+            }
+        };
+        state_guard.log = log_entries;
+    }
     /**
      * End utility functions for main RPC's
      */
@@ -792,8 +851,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         server
     }
 
-    fn listen_for_messages(&self) {
-        for message in self.from_rpc_receiver.iter() {
+    fn listen_for_messages(&mut self) {
+        let messages: Vec<RPCMessage<T>> = self.from_rpc_receiver.try_iter().collect();
+        for message in messages {
             match message {
                 RPCMessage::VoteRequest(vote_request) => {
                     info!("Received a vote request {:?}", vote_request);
@@ -857,7 +917,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         }
     }
 
-    fn start(&self) {
+    fn start(&mut self) {
         self.rpc_manager.start();
         self.listen_for_messages();
     }
