@@ -5,37 +5,29 @@ use std::{
     str::FromStr,
 };
 
-use log::info;
-
 use crate::{
     types::{ServerId, Term},
     LogEntry, LogEntryCommand,
 };
 
-trait BaseFileOps {
+pub trait RaftFileOps<T: Clone + FromStr + Display> {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error>;
     fn write_term_and_voted_for(
         &mut self,
         term: Term,
         voted_for: ServerId,
     ) -> Result<(), io::Error>;
-}
-
-trait GenericFileOps<T: Clone + FromStr + Display>
-where
-    T::Err: Display,
-{
     fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error>;
     fn append_logs(&mut self, entries: &Vec<LogEntry<T>>) -> Result<(), io::Error>;
 }
 
-pub struct DirectFileOps {
+pub struct DirectFileOpsWriter {
     file_path: String,
     file: Option<File>,
 }
 
-impl DirectFileOps {
-    fn new(file_path: &str, server_id: ServerId) -> Result<Self, io::Error> {
+impl DirectFileOpsWriter {
+    pub fn new(file_path: &str, server_id: ServerId) -> Result<Self, io::Error> {
         let file_name = format!("{}_server_{}", file_path, server_id);
         let file = OpenOptions::new()
             .read(true)
@@ -43,14 +35,14 @@ impl DirectFileOps {
             .create(true)
             .open(&file_name)?;
 
-        Ok(DirectFileOps {
+        Ok(DirectFileOpsWriter {
             file_path: file_name,
             file: Some(file),
         })
     }
 }
 
-impl BaseFileOps for DirectFileOps {
+impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error> {
         let mut file = self.file.as_ref().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
@@ -80,12 +72,6 @@ impl BaseFileOps for DirectFileOps {
         file.flush()?;
         Ok(())
     }
-}
-
-impl<T: Clone + FromStr + Display> GenericFileOps<T> for DirectFileOps
-where
-    T::Err: Display,
-{
     fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error> {
         let file = self.file.as_mut().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
@@ -119,7 +105,7 @@ where
             })?;
             let key: String = values[3].trim().to_string();
             let value: T = values[4].trim().parse().map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("Invalid value: {}", e))
+                io::Error::new(io::ErrorKind::InvalidData, format!("Invalid value"))
             })?;
             entries.push(LogEntry {
                 term,
@@ -167,6 +153,8 @@ impl std::str::FromStr for TestEntryData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::info;
+
     use std::{
         fs::remove_file,
         io::{self, Read},
@@ -176,16 +164,19 @@ mod tests {
 
     use crate::{LogEntry, LogEntryCommand};
 
-    use super::{BaseFileOps, DirectFileOps, GenericFileOps, TestEntryData};
+    use super::{DirectFileOpsWriter, RaftFileOps, TestEntryData};
 
     #[test]
     fn test_term_and_voted_for_write_and_read() -> Result<(), io::Error> {
         info!("Starting test_term_and_voted_for_write_and_read");
         let _ = env_logger::try_init();
         let temp_file = "temp_file";
-        let mut ops = DirectFileOps::new(temp_file, 0)?;
-        ops.write_term_and_voted_for(1, 2)?;
-        let (term, voted_for) = ops.read_term_and_voted_for()?;
+        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops, 1, 2,
+        )?;
+        let (term, voted_for) =
+            <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_term_and_voted_for(&ops)?;
         debug!("{},{}", term, voted_for);
         remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(term, 1);
@@ -198,8 +189,10 @@ mod tests {
         info!("Starting dummy_test");
         let _ = env_logger::try_init();
         let temp_file = "temp_file";
-        let mut ops = DirectFileOps::new(temp_file, 0)?;
-        ops.write_term_and_voted_for(1, 2)?;
+        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops, 1, 2,
+        );
 
         // Write a single log entry
         let log_entry = LogEntry {
@@ -224,8 +217,10 @@ mod tests {
         info!("Starting test_log_entries_write_and_read");
         let _ = env_logger::try_init();
         let temp_file = "temp_file";
-        let mut ops = DirectFileOps::new(temp_file, 0)?;
-        ops.write_term_and_voted_for(1, 2)?;
+        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops, 1, 2,
+        )?;
 
         //  generate a bunch of log entries and write them
         let mut log_entries: Vec<LogEntry<TestEntryData>> = Vec::new();
@@ -245,7 +240,7 @@ mod tests {
 
         //  read your own writes here
         let read_log_entries =
-            <DirectFileOps as GenericFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
+            <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
         remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(log_entries.len(), read_log_entries.len());
         Ok(())
@@ -256,8 +251,10 @@ mod tests {
         info!("Starting test_log_entries_write_and_read_from_offset");
         let _ = env_logger::try_init();
         let temp_file = "temp_file";
-        let mut ops = DirectFileOps::new(temp_file, 0)?;
-        ops.write_term_and_voted_for(1, 2)?;
+        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops, 1, 2,
+        )?;
 
         //  generate a bunch of logs and write them
         let mut log_entries: Vec<LogEntry<TestEntryData>> = Vec::new();
@@ -277,7 +274,7 @@ mod tests {
 
         //  reading your own writes from some offset here
         let read_log_entries =
-            <DirectFileOps as GenericFileOps<TestEntryData>>::read_logs(&mut ops, 50)?;
+            <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 50)?;
         remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(log_entries.len() - 49, read_log_entries.len());
         Ok(())

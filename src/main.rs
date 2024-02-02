@@ -21,7 +21,7 @@ mod storage;
 mod types;
 
 use crate::types::{ServerId, Term};
-use storage::DirectFileOps;
+use storage::{DirectFileOpsWriter, RaftFileOps};
 
 /**
  * RPC Stuff
@@ -275,7 +275,7 @@ struct RaftNodeState<T: Serialize + DeserializeOwned + Clone> {
     votes_received: HashMap<ServerId, bool>,
 }
 
-struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>> {
+struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> {
     id: ServerId,
     state: Mutex<RaftNodeState<T>>,
     state_machine: S,
@@ -284,9 +284,10 @@ struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>> {
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
     from_rpc_receiver: mpsc::Receiver<RPCMessage<T>>,
     rpc_manager: RPCManager<T>,
+    persistence_manager: F,
 }
 
-impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
+impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> {
     /**
     * BecomeLeader(i) ==
        /\ state[i] = Candidate
@@ -386,7 +387,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
             };
         }
 
-        //  all checks have passed - grant the vote but only after recording it
+        //  all checks have passed - grant the vote but only after recording it. Also write it to disk
         state_guard.voted_for = Some(request.candidate_id);
         VoteResponse {
             term: state_guard.current_term,
@@ -463,7 +464,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
-                match_index: 0,
+                match_index: request.prev_log_index,
             };
         }
 
@@ -482,7 +483,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
-                match_index: 0,
+                match_index: request.prev_log_index,
             };
         }
 
@@ -493,13 +494,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
             state_guard.status = RaftNodeStatus::Follower;
         }
 
+        //  heartbeat check
         if request.entries.len() == 0 {
-            //  this is a heartbeat request
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
-                match_index: 0, //  TODO: Fix this
+                match_index: request.prev_log_index, // no new logs have been committed
             };
         }
 
@@ -749,11 +750,11 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
     //  From this point onward are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
     fn new(
-        &self,
         id: ServerId,
         state_machine: S,
         config: ServerConfig,
         peers: Vec<ServerId>,
+        persistence_manager: F,
     ) -> Self {
         let election_jitter = rand::thread_rng().gen_range(0..100);
         let election_timeout = config.election_timeout + Duration::from_millis(election_jitter);
@@ -771,10 +772,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
         };
         let (to_node_sender, from_rpc_receiver) = mpsc::channel();
         let rpc_manager = RPCManager::new(
-            self.id,
-            self.config.address.clone(),
-            self.config.port,
-            self.to_node_sender.clone(),
+            id,
+            config.address.clone(),
+            config.port,
+            to_node_sender.clone(),
         );
         let server = RaftNode {
             id,
@@ -785,6 +786,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
             to_node_sender,
             from_rpc_receiver,
             rpc_manager,
+            persistence_manager,
         };
         info!("Initialising a new raft server with id {}", id);
         server
@@ -861,11 +863,45 @@ impl<T: RaftTypeTrait, S: StateMachine<T>> RaftNode<T, S> {
     }
 }
 
-fn main() {}
+fn main() {
+    let persistence_manager = match DirectFileOpsWriter::new("temp", 0) {
+        Ok(pm) => pm,
+        Err(e) => {
+            panic!(
+                "There was an error while creating the persistence manager {}",
+                e
+            );
+        }
+    };
+    let state_machine = KeyValueStore::<String>::new();
+    let server_config = ServerConfig {
+        election_timeout: Duration::from_millis(150),
+        heartbeat_interval: Duration::from_millis(50),
+        address: "127.0.0.1:8080".to_string(),
+        port: 0,
+        cluster_nodes: vec![1, 2, 3],
+        id_to_address_mapping: HashMap::new(),
+    };
+    let server = RaftNode::new(
+        0,
+        state_machine,
+        server_config,
+        vec![1, 2, 3],
+        persistence_manager,
+    );
+}
 
 //  An example state machine - a key value store
 struct KeyValueStore<T> {
     store: RefCell<HashMap<String, T>>,
+}
+
+impl<T> KeyValueStore<T> {
+    fn new() -> Self {
+        KeyValueStore {
+            store: RefCell::new(HashMap::new()),
+        }
+    }
 }
 
 impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {

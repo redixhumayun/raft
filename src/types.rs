@@ -1,4 +1,7 @@
-use std::fmt::Debug;
+use std::{
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -16,11 +19,27 @@ pub type ServerId = u64;
  * 6. Clone -> Can create a duplicate of itself
  */
 pub trait RaftTypeTrait:
-    Serialize + for<'de> Deserialize<'de> + DeserializeOwned + Send + 'static + Debug + Clone
+    Serialize
+    + for<'de> Deserialize<'de>
+    + DeserializeOwned
+    + Send
+    + 'static
+    + Debug
+    + Clone
+    + FromStr
+    + Display
 {
 }
 impl<
-        T: Serialize + for<'de> Deserialize<'de> + DeserializeOwned + Send + 'static + Debug + Clone,
+        T: Serialize
+            + for<'de> Deserialize<'de>
+            + DeserializeOwned
+            + Send
+            + 'static
+            + Debug
+            + Clone
+            + FromStr
+            + Display,
     > RaftTypeTrait for T
 {
 }
