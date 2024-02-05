@@ -440,7 +440,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
     }
 
     fn handle_append_entries_request(
-        &self,
+        &mut self,
         request: &AppendEntriesRequest<T>,
     ) -> AppendEntriesResponse {
         let mut state_guard = self.state.lock().unwrap();
@@ -466,6 +466,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
                 && request.prev_log_index <= state_guard.log.len() as u64
                 && request.prev_log_term == prev_log_term_for_this_node);
 
+        //  the log check is not OK, give false response
         if !log_ok {
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -593,26 +594,26 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
     }
 
     /**
-                 * Utility functions for main RPC's
-                 * All these functions expect a MutexGuard to be passed in to them
-                 */
+                                 * Utility functions for main RPC's
+                                 * All these functions expect a MutexGuard to be passed in to them
+                                 */
     /**
-                * BecomeLeader(i) ==
-                   /\ state[i] = Candidate
-                   /\ votesGranted[i] \in Quorum
-                   /\ state'      = [state EXCEPT ![i] = Leader]
-                   /\ nextIndex'  = [nextIndex EXCEPT ![i] =
-                                       [j \in Server |-> Len(log[i]) + 1]]
-                   /\ matchIndex' = [matchIndex EXCEPT ![i] =
-                                       [j \in Server |-> 0]]
-                   /\ elections'  = elections \cup
-                                       {[eterm     |-> currentTerm[i],
-                                       eleader   |-> i,
-                                       elog      |-> log[i],
-                                       evotes    |-> votesGranted[i],
-                                       evoterLog |-> voterLog[i]]}
-                   /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
-                */
+                                * BecomeLeader(i) ==
+                                   /\ state[i] = Candidate
+                                   /\ votesGranted[i] \in Quorum
+                                   /\ state'      = [state EXCEPT ![i] = Leader]
+                                   /\ nextIndex'  = [nextIndex EXCEPT ![i] =
+                                                       [j \in Server |-> Len(log[i]) + 1]]
+                                   /\ matchIndex' = [matchIndex EXCEPT ![i] =
+                                                       [j \in Server |-> 0]]
+                                   /\ elections'  = elections \cup
+                                                       {[eterm     |-> currentTerm[i],
+                                                       eleader   |-> i,
+                                                       elog      |-> log[i],
+                                                       evotes    |-> votesGranted[i],
+                                                       evoterLog |-> voterLog[i]]}
+                                   /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
+                                */
     fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
         state_guard.status = RaftNodeStatus::Leader;
         let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
