@@ -393,6 +393,7 @@ mod tests {
         //  read the logs
         let read_log_entries =
             <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
+        remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(read_log_entries.len(), 40);
         Ok(())
     }
