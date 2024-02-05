@@ -1,3 +1,4 @@
+use clock::{Clock, MockClock, RealClock};
 use core::fmt;
 use serde::de::DeserializeOwned;
 use serde_json;
@@ -7,16 +8,17 @@ use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
-use std::sync::{mpsc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufReader};
-use std::{env, thread};
 use types::RaftTypeTrait;
 
 use log::{error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+mod clock;
 mod storage;
 mod types;
 
@@ -32,6 +34,7 @@ struct RPCManager<T: RaftTypeTrait> {
     server_address: String,
     port: u64,
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
+    stop_flag: Arc<Mutex<bool>>,
     _marker: PhantomData<T>,
 }
 
@@ -47,6 +50,7 @@ impl<T: RaftTypeTrait> RPCManager<T> {
             server_address,
             port,
             to_node_sender,
+            stop_flag: Arc::new(Mutex::new(false)),
             _marker: PhantomData,
         }
     }
@@ -55,7 +59,8 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         let server_address = self.server_address.clone();
         let server_id = self.server_id.clone();
         let to_node_sender = self.to_node_sender.clone();
-        thread::spawn(move || {
+        let stop_flag_cloned = self.stop_flag.clone();
+        let listener_handle = thread::spawn(move || {
             let listener = match TcpListener::bind(&server_address) {
                 Ok(tcp_listener) => tcp_listener,
                 Err(e) => {
@@ -67,6 +72,10 @@ impl<T: RaftTypeTrait> RPCManager<T> {
             };
 
             for stream in listener.incoming() {
+                let stop_flag_value = stop_flag_cloned.lock().unwrap();
+                if stop_flag_value.to_owned() == false {
+                    break;
+                }
                 match stream {
                     Ok(stream) => {
                         let reader = BufReader::new(stream);
@@ -103,6 +112,7 @@ impl<T: RaftTypeTrait> RPCManager<T> {
                 }
             }
         });
+        listener_handle.join();
     }
 
     /**
@@ -254,6 +264,31 @@ enum RaftNodeStatus {
     Follower,
 }
 
+enum RaftNodeClock {
+    RealClock(RealClock),
+    MockClock(MockClock),
+}
+
+impl RaftNodeClock {
+    fn advance(&mut self, duration: Duration) {
+        match self {
+            RaftNodeClock::RealClock(_) => {
+                panic!("This method should never be called for a real clock");
+            }
+            RaftNodeClock::MockClock(clock) => clock.advance(duration),
+        }
+    }
+}
+
+impl Clock for RaftNodeClock {
+    fn now(&self) -> Instant {
+        match self {
+            RaftNodeClock::RealClock(clock) => clock.now(),
+            RaftNodeClock::MockClock(clock) => clock.now(),
+        }
+    }
+}
+
 struct RaftNodeState<T: Serialize + DeserializeOwned + Clone> {
     //  persistent state on all servers
     current_term: Term,
@@ -285,9 +320,10 @@ struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> {
     from_rpc_receiver: mpsc::Receiver<RPCMessage<T>>,
     rpc_manager: RPCManager<T>,
     persistence_manager: F,
+    clock: RaftNodeClock,
 }
 
-impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> {
+impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> RaftNode<T, S, F> {
     /**
          * \* Message handlers
     \* i = recipient, j = sender, m = message
@@ -869,22 +905,21 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         state_guard.last_heartbeat = Instant::now();
     }
 
-    fn check_election_timeout(&mut self) {
-        let mut state_guard = self.state.lock().unwrap();
-        if state_guard.last_heartbeat.elapsed() >= self.config.election_timeout {
+    fn check_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        if (self.clock.now() - state_guard.last_heartbeat) >= state_guard.election_timeout {
             match state_guard.status {
                 RaftNodeStatus::Leader => {
                     //  do nothing
                 }
                 RaftNodeStatus::Candidate => {
                     state_guard.status = RaftNodeStatus::Follower;
-                    state_guard.last_heartbeat = Instant::now();
+                    self.reset_election_timeout(state_guard);
                 }
                 RaftNodeStatus::Follower => {
                     state_guard.status = RaftNodeStatus::Candidate;
                     state_guard.current_term += 1;
                     state_guard.voted_for = Some(self.id);
-                    self.reset_election_timeout(&mut state_guard);
+                    self.reset_election_timeout(state_guard);
                     self.start_election(&state_guard);
                 }
             }
@@ -904,6 +939,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         v.len() as u64
     }
 
+    fn is_leader(&self) -> bool {
+        let state_guard = self.state.lock().unwrap();
+        state_guard.status == RaftNodeStatus::Leader
+    }
     /**
      * End helper functions
      */
@@ -916,6 +955,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         config: ServerConfig,
         peers: Vec<ServerId>,
         persistence_manager: F,
+        clock: RaftNodeClock,
     ) -> Self {
         let election_jitter = rand::thread_rng().gen_range(0..100);
         let election_timeout = config.election_timeout + Duration::from_millis(election_jitter);
@@ -949,6 +989,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             from_rpc_receiver,
             rpc_manager,
             persistence_manager,
+            clock,
         };
         info!("Initialising a new raft server with id {}", id);
         server
@@ -1020,8 +1061,16 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         }
     }
 
-    fn tick(&self) {
-        let state_guard = self.state.lock().unwrap();
+    fn start(&mut self) {
+        self.rpc_manager.start();
+    }
+
+    fn stop(&self) {
+        //stop the RPC manager from here
+    }
+
+    fn tick(&mut self) {
+        let mut state_guard = self.state.lock().unwrap();
         match state_guard.status {
             RaftNodeStatus::Leader => {
                 //  the leader should send heartbeats to all followers
@@ -1029,13 +1078,16 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             }
             RaftNodeStatus::Candidate | RaftNodeStatus::Follower => {
                 //  the candidate or follower should check if the election timeout has elapsed
+                self.check_election_timeout(&mut state_guard);
             }
         }
-    }
+        drop(state_guard);
 
-    fn start(&mut self) {
-        self.rpc_manager.start();
-        self.listen_for_messages();
+        //  listen to incoming messages from the RPC manager
+        loop {
+            self.listen_for_messages();
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -1058,13 +1110,16 @@ fn main() {
         cluster_nodes: vec![1, 2, 3],
         id_to_address_mapping: HashMap::new(),
     };
-    let server = RaftNode::new(
+    let clock = RaftNodeClock::RealClock(RealClock {});
+    let mut server = RaftNode::new(
         0,
         state_machine,
         server_config,
         vec![1, 2, 3],
         persistence_manager,
+        clock,
     );
+    server.start();
 }
 
 //  An example state machine - a key value store
@@ -1098,15 +1153,14 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /**
      * Use this method to create a test cluster of nodes
      */
-    fn create_test_cluster(
-        number_of_nodes: u64,
-        starting_port: u64,
-    ) -> Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+    type TestCluster = Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>;
+    fn create_test_cluster(number_of_nodes: u64, starting_port: u64) -> TestCluster {
         let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
         let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
         let ports: Vec<u64> = (starting_port..starting_port + number_of_nodes).collect();
@@ -1122,8 +1176,7 @@ mod tests {
         let mut counter = 0;
         for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
             let server_config = ServerConfig {
-                election_timeout: Duration::from_millis(150)
-                    + Duration::from_millis(rand::thread_rng().gen_range(0..100)),
+                election_timeout: Duration::from_millis(150),
                 heartbeat_interval: Duration::from_millis(50),
                 address: address.clone(),
                 port: ports[counter],
@@ -1133,12 +1186,17 @@ mod tests {
 
             let state_machine = KeyValueStore::<i32>::new();
             let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
+            let mock_clock = RaftNodeClock::MockClock(MockClock {
+                current_time: Instant::now(),
+            });
+
             let node = RaftNode::new(
                 *node_id,
                 state_machine,
                 server_config,
                 node_ids.clone(),
                 persistence_manager,
+                mock_clock,
             );
             nodes.push(node);
             counter += 1;
@@ -1146,8 +1204,22 @@ mod tests {
         nodes
     }
 
+    fn advance_cluster_by(cluster: &mut TestCluster, advance_by: Duration) {
+        for node in cluster {
+            node.clock.advance(advance_by);
+        }
+    }
+
+    fn cluster_tick(cluster: &mut TestCluster) {
+        for node in cluster {
+            node.tick();
+        }
+    }
+
     #[test]
     fn test_leader_election() {
-        let cluster = create_test_cluster(3, 8000);
+        let mut cluster = create_test_cluster(3, 8000);
+        advance_cluster_by(&mut cluster, Duration::from_millis(250));
+        cluster_tick(&mut cluster);
     }
 }
