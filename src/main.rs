@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::{mpsc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufReader};
 use std::{env, thread};
 use types::RaftTypeTrait;
@@ -269,10 +269,10 @@ struct RaftNodeState<T: Serialize + DeserializeOwned + Clone> {
     next_index: Vec<u64>,
     match_index: Vec<u64>,
 
-    election_timeout: Duration,
-
     //  election variables
     votes_received: HashMap<ServerId, bool>,
+    election_timeout: Duration,
+    last_heartbeat: Instant,
 }
 
 struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> {
@@ -483,8 +483,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             state_guard.status = RaftNodeStatus::Follower;
         }
 
-        //  heartbeat check
+        //  heartbeat check - register the heartbeat time
         if request.entries.len() == 0 {
+            self.reset_election_timeout(&mut state_guard);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
@@ -531,12 +532,27 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             }
 
             if conflict_point != -1 {
+                info!(
+                    "Conflict point detected, truncating logs for node {}",
+                    self.id
+                );
                 state_guard.log.truncate(conflict_point as usize);
+            } else {
+                conflict_point = self.len_as_u64(&state_guard.log) as i64;
             }
 
             //  Now, start appending logs from the conflict point onwards
             let entries_to_insert = &request.entries[(conflict_point as usize)..];
             state_guard.log.extend_from_slice(entries_to_insert);
+            if let Err(e) = self
+                .persistence_manager
+                .append_logs_at(&entries_to_insert.to_vec(), conflict_point as u64)
+            {
+                error!(
+                    "There was a problem appending logs to stable storage for node {}: {}",
+                    self.id, e
+                );
+            }
             if request.leader_commit_index > state_guard.commit_index {
                 state_guard.commit_index = min(
                     request.leader_commit_index,
@@ -563,7 +579,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         };
     }
 
-    fn handle_append_entries_response(&self, response: AppendEntriesResponse) {
+    fn handle_append_entries_response(&mut self, response: AppendEntriesResponse) {
         let mut state_guard = self.state.lock().unwrap();
         if state_guard.current_term < response.term && !response.success {
             return;
@@ -572,11 +588,22 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         let server_index = response.server_id as usize;
 
         if !response.success {
-            //  check if the response term is greater - if it is, step down as leader
+            //  check if the response term is greater - if it is, step down as leader and record the new term
             if state_guard.current_term < response.term {
                 self.update_term(&mut state_guard, response.term);
+                if let Err(e) = self
+                    .persistence_manager
+                    .write_term_and_voted_for(response.term, Option::None)
+                {
+                    error!(
+                        "There was a problem writing the term and voted_for variables to stable storage for node {}: {}",
+                        self.id, e
+                    );
+                }
+                return;
             }
 
+            //  there isn't a new term - reduce the next index for that server and try again
             state_guard.next_index[server_index] = state_guard.next_index[server_index]
                 .saturating_sub(1)
                 .max(1);
@@ -593,27 +620,24 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         return;
     }
 
+    //  Utility functions for main RPC's
     /**
-                                 * Utility functions for main RPC's
-                                 * All these functions expect a MutexGuard to be passed in to them
-                                 */
-    /**
-                                * BecomeLeader(i) ==
-                                   /\ state[i] = Candidate
-                                   /\ votesGranted[i] \in Quorum
-                                   /\ state'      = [state EXCEPT ![i] = Leader]
-                                   /\ nextIndex'  = [nextIndex EXCEPT ![i] =
-                                                       [j \in Server |-> Len(log[i]) + 1]]
-                                   /\ matchIndex' = [matchIndex EXCEPT ![i] =
-                                                       [j \in Server |-> 0]]
-                                   /\ elections'  = elections \cup
-                                                       {[eterm     |-> currentTerm[i],
-                                                       eleader   |-> i,
-                                                       elog      |-> log[i],
-                                                       evotes    |-> votesGranted[i],
-                                                       evoterLog |-> voterLog[i]]}
-                                   /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
-                                */
+    * BecomeLeader(i) ==
+        /\ state[i] = Candidate
+        /\ votesGranted[i] \in Quorum
+        /\ state'      = [state EXCEPT ![i] = Leader]
+        /\ nextIndex'  = [nextIndex EXCEPT ![i] =
+                            [j \in Server |-> Len(log[i]) + 1]]
+        /\ matchIndex' = [matchIndex EXCEPT ![i] =
+                            [j \in Server |-> 0]]
+        /\ elections'  = elections \cup
+                            {[eterm     |-> currentTerm[i],
+                            eleader   |-> i,
+                            elog      |-> log[i],
+                            evotes    |-> votesGranted[i],
+                            evoterLog |-> voterLog[i]]}
+        /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
+    */
     fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
         state_guard.status = RaftNodeStatus::Leader;
         let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
@@ -786,14 +810,91 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         };
         state_guard.log = log_entries;
     }
-    /**
-     * End utility functions for main RPC's
-     */
+
+    fn start_election(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) {
+        if state_guard.status != RaftNodeStatus::Candidate {
+            return;
+        }
+
+        for peer in &self.peers {
+            if peer == &self.id {
+                continue;
+            }
+            //  send out a vote request to all the remaining nodes
+            let vote_request = VoteRequest {
+                term: state_guard.current_term,
+                candidate_id: self.id,
+                last_log_index: state_guard.log.last().map_or(0, |entry| entry.index),
+                last_log_term: state_guard.log.last().map_or(0, |entry| entry.term),
+            };
+            let message = RPCMessage::<T>::VoteRequest(vote_request);
+            let to_address = self.config.id_to_address_mapping.get(&peer).expect(
+                format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
+            );
+            self.rpc_manager
+                .send_message(self.id, *peer, to_address.clone(), message);
+        }
+    }
+
+    fn send_heartbeat(&self) {
+        let state_guard = self.state.lock().unwrap();
+        if state_guard.status != RaftNodeStatus::Leader {
+            return;
+        }
+
+        for peer in &self.peers {
+            if *peer == self.id {
+                //  ignore this node itself
+                continue;
+            }
+            let heartbeat_request = AppendEntriesRequest {
+                term: state_guard.current_term,
+                leader_id: self.id,
+                prev_log_index: state_guard.log.last().unwrap().index,
+                prev_log_term: state_guard.log.last().unwrap().term,
+                entries: Vec::<LogEntry<T>>::new(),
+                leader_commit_index: state_guard.commit_index,
+            };
+            let to_address = self.config.id_to_address_mapping.get(peer).expect(
+                format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
+            );
+            let message = RPCMessage::<T>::AppendEntriesRequest(heartbeat_request);
+
+            self.rpc_manager
+                .send_message(self.id, *peer, to_address.clone(), message);
+        }
+    }
+
+    fn reset_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        state_guard.last_heartbeat = Instant::now();
+    }
+
+    fn check_election_timeout(&mut self) {
+        let mut state_guard = self.state.lock().unwrap();
+        if state_guard.last_heartbeat.elapsed() >= self.config.election_timeout {
+            match state_guard.status {
+                RaftNodeStatus::Leader => {
+                    //  do nothing
+                }
+                RaftNodeStatus::Candidate => {
+                    state_guard.status = RaftNodeStatus::Follower;
+                    state_guard.last_heartbeat = Instant::now();
+                }
+                RaftNodeStatus::Follower => {
+                    state_guard.status = RaftNodeStatus::Candidate;
+                    state_guard.current_term += 1;
+                    state_guard.voted_for = Some(self.id);
+                    self.reset_election_timeout(&mut state_guard);
+                    self.start_election(&state_guard);
+                }
+            }
+        }
+    }
+    //  End utility functions for main RPC's
 
     /**
      * Helper functions
      */
-
     //  The quorum size is (N/2) + 1, where N = number of servers in the cluster
     fn quorum_size(&self) -> usize {
         (self.config.cluster_nodes.len() / 2) + 1
@@ -829,6 +930,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
             last_applied: 0,
             next_index: Vec::new(),
             match_index: Vec::new(),
+            last_heartbeat: Instant::now(),
         };
         let (to_node_sender, from_rpc_receiver) = mpsc::channel();
         let rpc_manager = RPCManager::new(
@@ -918,6 +1020,19 @@ impl<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> RaftNode<T, S, F> 
         }
     }
 
+    fn tick(&self) {
+        let state_guard = self.state.lock().unwrap();
+        match state_guard.status {
+            RaftNodeStatus::Leader => {
+                //  the leader should send heartbeats to all followers
+                self.send_heartbeat();
+            }
+            RaftNodeStatus::Candidate | RaftNodeStatus::Follower => {
+                //  the candidate or follower should check if the election timeout has elapsed
+            }
+        }
+    }
+
     fn start(&mut self) {
         self.rpc_manager.start();
         self.listen_for_messages();
@@ -978,5 +1093,61 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
         for entry in entries {
             self.store.borrow_mut().insert(entry.key, entry.value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /**
+     * Use this method to create a test cluster of nodes
+     */
+    fn create_test_cluster(
+        number_of_nodes: u64,
+        starting_port: u64,
+    ) -> Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+        let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
+        let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
+        let ports: Vec<u64> = (starting_port..starting_port + number_of_nodes).collect();
+        let addresses: Vec<String> = ports
+            .iter()
+            .map(|port| format!("127.0.0.1:{}", port))
+            .collect();
+        let mut id_to_address_mapping: HashMap<ServerId, String> = HashMap::new();
+        for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+            id_to_address_mapping.insert(*node_id, address.clone());
+        }
+
+        let mut counter = 0;
+        for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+            let server_config = ServerConfig {
+                election_timeout: Duration::from_millis(150)
+                    + Duration::from_millis(rand::thread_rng().gen_range(0..100)),
+                heartbeat_interval: Duration::from_millis(50),
+                address: address.clone(),
+                port: ports[counter],
+                cluster_nodes: node_ids.clone(),
+                id_to_address_mapping: id_to_address_mapping.clone(),
+            };
+
+            let state_machine = KeyValueStore::<i32>::new();
+            let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
+            let node = RaftNode::new(
+                *node_id,
+                state_machine,
+                server_config,
+                node_ids.clone(),
+                persistence_manager,
+            );
+            nodes.push(node);
+            counter += 1;
+        }
+        nodes
+    }
+
+    #[test]
+    fn test_leader_election() {
+        let cluster = create_test_cluster(3, 8000);
     }
 }

@@ -219,8 +219,6 @@ mod tests {
         io::{self, Read},
     };
 
-    use log::debug;
-
     use crate::{LogEntry, LogEntryCommand};
 
     use super::{DirectFileOpsWriter, RaftFileOps, TestEntryData};
