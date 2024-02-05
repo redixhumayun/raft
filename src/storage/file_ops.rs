@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fmt::Display,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
@@ -15,11 +16,11 @@ use crate::{
 pub trait RaftFileOps<T: Clone + FromStr + Display> {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error>;
     fn write_term_and_voted_for(
-        &mut self,
+        &self,
         term: Term,
         voted_for: Option<ServerId>,
     ) -> Result<(), io::Error>;
-    fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error>;
+    fn read_logs(&self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error>;
     fn append_logs(&mut self, entries: &Vec<LogEntry<T>>) -> Result<(), io::Error>;
     fn append_logs_at(
         &mut self,
@@ -30,7 +31,7 @@ pub trait RaftFileOps<T: Clone + FromStr + Display> {
 
 pub struct DirectFileOpsWriter {
     file_path: String,
-    file: Option<File>,
+    file: RefCell<Option<File>>,
 }
 
 impl DirectFileOpsWriter {
@@ -44,14 +45,16 @@ impl DirectFileOpsWriter {
 
         Ok(DirectFileOpsWriter {
             file_path: file_name,
-            file: Some(file),
+            file: RefCell::new(Some(file)),
         })
     }
 }
 
 impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error> {
-        let mut file = self.file.as_ref().expect("File not found");
+        // let mut file = self.file.as_ref().expect("File not found");
+        let binding = self.file.borrow_mut();
+        let mut file = binding.as_ref().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
         let mut buf_reader = BufReader::new(file);
         let mut line = String::new();
@@ -69,11 +72,12 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     }
 
     fn write_term_and_voted_for(
-        &mut self,
+        &self,
         term: Term,
         voted_for: Option<ServerId>,
     ) -> Result<(), io::Error> {
-        let file = self.file.as_mut().expect("File not found");
+        let mut binding = self.file.borrow_mut();
+        let file = binding.as_mut().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
         if let Some(v_f) = voted_for {
             writeln!(file, "{},{}", term, v_f)?;
@@ -83,8 +87,10 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
         file.flush()?;
         Ok(())
     }
-    fn read_logs(&mut self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error> {
-        let file = self.file.as_mut().expect("File not found");
+
+    fn read_logs(&self, log_index: u64) -> Result<Vec<LogEntry<T>>, io::Error> {
+        let mut binding = self.file.borrow_mut();
+        let file = binding.as_mut().expect("File not found");
         file.seek(SeekFrom::Start(0))?;
         let mut buf_reader = BufReader::new(file);
         let mut line = String::new();
@@ -130,7 +136,8 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     }
 
     fn append_logs(&mut self, entries: &Vec<LogEntry<T>>) -> Result<(), io::Error> {
-        let file = self.file.as_mut().expect("File not found");
+        let mut binding = self.file.borrow_mut();
+        let file = binding.as_mut().expect("File not found");
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
             writeln!(
@@ -242,35 +249,35 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dummy_test() -> Result<(), io::Error> {
-        info!("Starting dummy_test");
-        let _ = env_logger::try_init();
-        let temp_file = "temp_file";
-        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
-        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-            &mut ops,
-            1,
-            Option::Some(2),
-        )?;
+    // #[test]
+    // fn dummy_test() -> Result<(), io::Error> {
+    //     info!("Starting dummy_test");
+    //     let _ = env_logger::try_init();
+    //     let temp_file = "temp_file";
+    //     let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+    //     <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+    //         &mut ops,
+    //         1,
+    //         Option::Some(2),
+    //     )?;
 
-        // Write a single log entry
-        let log_entry = LogEntry {
-            term: 1,
-            index: 1,
-            command: LogEntryCommand::Set,
-            key: "key".to_string(),
-            value: TestEntryData("value".to_string()),
-        };
-        ops.append_logs(&vec![log_entry])?;
+    //     // Write a single log entry
+    //     let log_entry = LogEntry {
+    //         term: 1,
+    //         index: 1,
+    //         command: LogEntryCommand::Set,
+    //         key: "key".to_string(),
+    //         value: TestEntryData("value".to_string()),
+    //     };
+    //     ops.append_logs(&vec![log_entry])?;
 
-        // Flush and immediately read back the file content to inspect
-        let mut content = String::new();
-        ops.file.as_mut().unwrap().seek(SeekFrom::Start(0))?;
-        ops.file.as_mut().unwrap().read_to_string(&mut content)?;
-        println!("File content: {:?}", content);
-        Ok(())
-    }
+    //     // Flush and immediately read back the file content to inspect
+    //     let mut content = String::new();
+    //     ops.file.as_mut().unwrap().seek(SeekFrom::Start(0))?;
+    //     ops.file.as_mut().unwrap().read_to_string(&mut content)?;
+    //     println!("File content: {:?}", content);
+    //     Ok(())
+    // }
 
     #[test]
     fn test_log_entries_write_and_read() -> Result<(), io::Error> {

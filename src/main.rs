@@ -155,14 +155,14 @@ impl<T: RaftTypeTrait> RPCManager<T> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum RPCMessage<T: Clone> {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
     AppendEntriesRequest(AppendEntriesRequest<T>),
     AppendEntriesResponse(AppendEntriesResponse),
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct VoteRequest {
     term: Term,
     candidate_id: ServerId,
@@ -170,14 +170,14 @@ struct VoteRequest {
     last_log_term: Term,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct VoteResponse {
     term: Term,
     vote_granted: bool,
     candidate_id: ServerId, //  the id of the server granting the vote, used for de-duplication
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct AppendEntriesRequest<T: Clone> {
     term: Term,
     leader_id: ServerId,
@@ -187,7 +187,7 @@ struct AppendEntriesRequest<T: Clone> {
     leader_commit_index: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct AppendEntriesResponse {
     server_id: ServerId,
     term: Term,
@@ -626,7 +626,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         if !response.success {
             //  check if the response term is greater - if it is, step down as leader and record the new term
             if state_guard.current_term < response.term {
-                self.update_term(&mut state_guard, response.term);
+                // self.update_term(&mut state_guard, response.term);
                 if let Err(e) = self
                     .persistence_manager
                     .write_term_and_voted_for(response.term, Option::None)
@@ -687,10 +687,19 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn update_term(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>, new_term: Term) {
-        assert!(state_guard.status == RaftNodeStatus::Leader);
         state_guard.current_term = new_term;
         state_guard.voted_for = None;
         state_guard.status = RaftNodeStatus::Follower;
+        if let Err(e) = self
+            .persistence_manager
+            .write_term_and_voted_for(new_term, None)
+        {
+            //  valid to panic here because this is a write to disk
+            panic!(
+                "There was an error while writing the term and voted for to stable storage {}",
+                e
+            );
+        }
         return;
     }
 
@@ -847,6 +856,84 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.log = log_entries;
     }
 
+    fn message_update_term_if_required(&mut self, message: RPCMessage<T>) {
+        let mut state_guard = self.state.lock().unwrap();
+        match message {
+            RPCMessage::VoteRequest(message) => {
+                if message.term > state_guard.current_term {
+                    self.update_term(&mut state_guard, message.term);
+                }
+            }
+            RPCMessage::VoteResponse(message) => {
+                if message.term > state_guard.current_term {
+                    self.update_term(&mut state_guard, message.term);
+                }
+            }
+            RPCMessage::AppendEntriesRequest(message) => {
+                if message.term > state_guard.current_term {
+                    self.update_term(&mut state_guard, message.term);
+                }
+            }
+            RPCMessage::AppendEntriesResponse(message) => {
+                if message.term > state_guard.current_term {
+                    self.update_term(&mut state_guard, message.term);
+                }
+            }
+        }
+    }
+
+    fn is_message_stale(&self, message: RPCMessage<T>) -> bool {
+        let state_guard = self.state.lock().unwrap();
+        match message {
+            RPCMessage::VoteRequest(message) => message.term < state_guard.current_term,
+            RPCMessage::VoteResponse(message) => message.term < state_guard.current_term,
+            RPCMessage::AppendEntriesRequest(message) => message.term < state_guard.current_term,
+            RPCMessage::AppendEntriesResponse(message) => message.term < state_guard.current_term,
+        }
+    }
+    /**
+     * Receive(m) ==
+    LET i == m.mdest
+        j == m.msource
+    IN \* Any RPC with a newer term causes the recipient to advance
+       \* its term first. Responses with stale terms are ignored.
+       \/ UpdateTerm(i, j, m)
+       \/ /\ m.mtype = RequestVoteRequest
+          /\ HandleRequestVoteRequest(i, j, m)
+       \/ /\ m.mtype = RequestVoteResponse
+          /\ \/ DropStaleResponse(i, j, m)
+             \/ HandleRequestVoteResponse(i, j, m)
+       \/ /\ m.mtype = AppendEntriesRequest
+          /\ HandleAppendEntriesRequest(i, j, m)
+       \/ /\ m.mtype = AppendEntriesResponse
+          /\ \/ DropStaleResponse(i, j, m)
+             \/ HandleAppendEntriesResponse(i, j, m)
+     */
+    fn receive(&mut self, message: RPCMessage<T>) -> Option<(RPCMessage<T>, ServerId)> {
+        self.message_update_term_if_required(message.clone());
+        return match message {
+            RPCMessage::VoteRequest(request) => {
+                let response = self.handle_vote_request(&request);
+                Some((RPCMessage::VoteResponse(response), request.candidate_id))
+            }
+            RPCMessage::VoteResponse(response) => {
+                self.handle_vote_response(response);
+                None
+            }
+            RPCMessage::AppendEntriesRequest(request) => {
+                let response = self.handle_append_entries_request(&request);
+                Some((
+                    RPCMessage::AppendEntriesResponse(response),
+                    request.leader_id,
+                ))
+            }
+            RPCMessage::AppendEntriesResponse(response) => {
+                self.handle_append_entries_response(response);
+                None
+            }
+        };
+    }
+
     fn start_election(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) {
         if state_guard.status != RaftNodeStatus::Candidate {
             return;
@@ -996,67 +1083,26 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn listen_for_messages(&mut self) {
-        let messages: Vec<RPCMessage<T>> = self.from_rpc_receiver.try_iter().collect();
-        for message in messages {
-            match message {
-                RPCMessage::VoteRequest(vote_request) => {
-                    info!("Received a vote request {:?}", vote_request);
-                    let vote_response = self.handle_vote_request(&vote_request);
-                    info!("Sending a vote response {:?}", vote_response);
-                    let to_address = self
-                        .config
-                        .id_to_address_mapping
-                        .get(&vote_request.candidate_id)
-                        .expect(
-                            format!(
-                                "Cannot find the id to address mapping for candidate id {}",
-                                vote_request.candidate_id
-                            )
-                            .as_str(),
-                        );
-                    self.rpc_manager.send_message(
-                        self.id,
-                        vote_request.candidate_id,
-                        to_address.clone(),
-                        RPCMessage::<T>::VoteResponse(vote_response),
-                    );
-                }
-                RPCMessage::VoteResponse(vote_response) => {
-                    info!("Received a vote response {:?}", vote_response);
-                    self.handle_vote_response(vote_response);
-                }
-                RPCMessage::AppendEntriesRequest(append_entries_request) => {
-                    info!(
-                        "Received an append entries request {:?}",
-                        append_entries_request
-                    );
-                    let response = self.handle_append_entries_request(&append_entries_request);
-                    info!("Sending an append entries response {:?}", response);
-                    let to_address = self
-                        .config
-                        .id_to_address_mapping
-                        .get(&append_entries_request.leader_id)
-                        .expect(
-                            format!(
-                                "Cannot find the id to address mapping for leader id {}",
-                                append_entries_request.leader_id
-                            )
-                            .as_str(),
-                        );
-                    self.rpc_manager.send_message(
-                        self.id,
-                        append_entries_request.leader_id,
-                        to_address.clone(),
-                        RPCMessage::<T>::AppendEntriesResponse(response),
-                    );
-                }
-                RPCMessage::AppendEntriesResponse(append_entries_response) => {
-                    info!(
-                        "Received an append entries response {:?}",
-                        append_entries_response
-                    );
-                    self.handle_append_entries_response(append_entries_response);
-                }
+        if let Ok(message) = self.from_rpc_receiver.try_recv() {
+            if self.is_message_stale(message.clone()) {
+                //  dropping a stale message
+                return;
+            }
+
+            if let Some((message_response, from_id)) = self.receive(message.clone()) {
+                let to_address = self.config.id_to_address_mapping.get(&from_id).expect(
+                    format!(
+                        "Cannot find the id to address mapping for peer id {}",
+                        from_id
+                    )
+                    .as_str(),
+                );
+                self.rpc_manager.send_message(
+                    self.id,
+                    from_id,
+                    to_address.to_owned(),
+                    message_response,
+                );
             }
         }
     }
