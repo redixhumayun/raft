@@ -6,8 +6,6 @@ use std::{
     str::FromStr,
 };
 
-use log::info;
-
 use crate::{
     types::{ServerId, Term},
     LogEntry, LogEntryCommand,
@@ -121,7 +119,7 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
                 )
             })?;
             let key: String = values[3].trim().to_string();
-            let value: T = values[4].trim().parse().map_err(|e| {
+            let value: T = values[4].trim().parse().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Invalid value"))
             })?;
             entries.push(LogEntry {
@@ -218,12 +216,11 @@ impl std::str::FromStr for TestEntryData {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use log::info;
 
     use std::{
         fs::remove_file,
-        io::{self, Read},
+        io::{self},
     };
 
     use crate::{LogEntry, LogEntryCommand};

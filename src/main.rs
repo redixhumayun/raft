@@ -8,6 +8,7 @@ use std::io::{self, BufRead, Write};
 use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ struct RPCManager<T: RaftTypeTrait> {
     server_address: String,
     port: u64,
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
-    stop_flag: Arc<Mutex<bool>>,
+    is_running: Arc<AtomicBool>,
     _marker: PhantomData<T>,
 }
 
@@ -50,7 +51,7 @@ impl<T: RaftTypeTrait> RPCManager<T> {
             server_address,
             port,
             to_node_sender,
-            stop_flag: Arc::new(Mutex::new(false)),
+            is_running: Arc::new(AtomicBool::new(false)),
             _marker: PhantomData,
         }
     }
@@ -59,8 +60,9 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         let server_address = self.server_address.clone();
         let server_id = self.server_id.clone();
         let to_node_sender = self.to_node_sender.clone();
-        let stop_flag_cloned = self.stop_flag.clone();
-        let listener_handle = thread::spawn(move || {
+        let is_running = self.is_running.clone();
+        is_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread::spawn(move || {
             let listener = match TcpListener::bind(&server_address) {
                 Ok(tcp_listener) => tcp_listener,
                 Err(e) => {
@@ -72,8 +74,7 @@ impl<T: RaftTypeTrait> RPCManager<T> {
             };
 
             for stream in listener.incoming() {
-                let stop_flag_value = stop_flag_cloned.lock().unwrap();
-                if stop_flag_value.to_owned() == false {
+                if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
                 match stream {
@@ -112,7 +113,11 @@ impl<T: RaftTypeTrait> RPCManager<T> {
                 }
             }
         });
-        listener_handle.join();
+    }
+
+    fn stop(&self) {
+        self.is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /**
@@ -198,7 +203,7 @@ struct AppendEntriesResponse {
 /**
  * End RPC stuff
  */
-
+#[derive(Debug)]
 struct ServerConfig {
     election_timeout: Duration, //  used to calculate the actual election timeout
     heartbeat_interval: Duration,
@@ -463,15 +468,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard
             .votes_received
             .insert(vote_response.candidate_id, vote_response.vote_granted);
-        let sum_of_votes_granted = state_guard
-            .votes_received
-            .iter()
-            .filter(|(_, vote_granted)| **vote_granted)
-            .count();
 
-        if sum_of_votes_granted == self.quorum_size() {
-            //  the candidate should become a leader
-            self.become_leader(state_guard);
+        if self.can_become_leader(&state_guard) {
+            self.become_leader(&mut state_guard);
         }
     }
 
@@ -674,7 +673,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                             evoterLog |-> voterLog[i]]}
         /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
     */
-    fn become_leader(&self, mut state_guard: MutexGuard<'_, RaftNodeState<T>>) {
+    fn become_leader(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         state_guard.status = RaftNodeStatus::Leader;
         let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
         state_guard.next_index = self
@@ -934,9 +933,44 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         };
     }
 
-    fn start_election(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) {
-        if state_guard.status != RaftNodeStatus::Candidate {
-            return;
+    fn can_become_leader(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) -> bool {
+        info!("Checking if node {} can become leader", self.id);
+        let sum_of_votes_received = state_guard
+            .votes_received
+            .iter()
+            .filter(|(_, vote_granted)| **vote_granted)
+            .count();
+        let quorum = self.quorum_size();
+        info!(
+            "Node has received {} votes and quorum size is {}",
+            sum_of_votes_received, quorum
+        );
+        return sum_of_votes_received >= quorum;
+    }
+
+    /*
+    This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
+    vote to storage and then send out messages to all other peers requesting votes
+    */
+    fn start_election(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        info!("Node {} is starting an election", self.id);
+        state_guard.status = RaftNodeStatus::Candidate;
+        state_guard.current_term += 1;
+        state_guard.voted_for = Some(self.id);
+        state_guard.votes_received.insert(self.id, true);
+        if let Err(e) = self
+            .persistence_manager
+            .write_term_and_voted_for(state_guard.current_term, state_guard.voted_for)
+        {
+            panic!(
+                "There was an error while writing the term and voted for to stable storage {}",
+                e
+            );
+        }
+
+        //  Check to ensure that a single node system will be immediately elected a leader. Feels a bit hacky
+        if self.can_become_leader(state_guard) {
+            self.become_leader(state_guard);
         }
 
         for peer in &self.peers {
@@ -967,7 +1001,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         for peer in &self.peers {
             if *peer == self.id {
-                //  ignore this node itself
+                //  ignore self referencing node
                 continue;
             }
             let heartbeat_request = AppendEntriesRequest {
@@ -997,26 +1031,23 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             match state_guard.status {
                 RaftNodeStatus::Leader => {
                     //  do nothing
+                    //  TODO: Is this valid? Should a leader really do nothing when an election times out?
                 }
                 RaftNodeStatus::Candidate => {
                     state_guard.status = RaftNodeStatus::Follower;
                     self.reset_election_timeout(state_guard);
                 }
                 RaftNodeStatus::Follower => {
-                    state_guard.status = RaftNodeStatus::Candidate;
-                    state_guard.current_term += 1;
-                    state_guard.voted_for = Some(self.id);
+                    info!("Node {} timed out, starting an election", self.id);
                     self.reset_election_timeout(state_guard);
-                    self.start_election(&state_guard);
+                    self.start_election(state_guard);
                 }
             }
         }
     }
     //  End utility functions for main RPC's
 
-    /**
-     * Helper functions
-     */
+    //  Helper functions
     //  The quorum size is (N/2) + 1, where N = number of servers in the cluster
     fn quorum_size(&self) -> usize {
         (self.config.cluster_nodes.len() / 2) + 1
@@ -1030,9 +1061,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         let state_guard = self.state.lock().unwrap();
         state_guard.status == RaftNodeStatus::Leader
     }
-    /**
-     * End helper functions
-     */
+    //  End helper functions
 
     //  From this point onward are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
@@ -1044,6 +1073,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         persistence_manager: F,
         clock: RaftNodeClock,
     ) -> Self {
+        info!(
+            "Creating a new node with the following id and config: {} {:?}",
+            id, config
+        );
         let election_jitter = rand::thread_rng().gen_range(0..100);
         let election_timeout = config.election_timeout + Duration::from_millis(election_jitter);
         let server_state = RaftNodeState {
@@ -1078,7 +1111,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             persistence_manager,
             clock,
         };
-        info!("Initialising a new raft server with id {}", id);
         server
     }
 
@@ -1108,32 +1140,34 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn start(&mut self) {
+        let _state_guard = self.state.lock().unwrap();
         self.rpc_manager.start();
     }
 
     fn stop(&self) {
-        //stop the RPC manager from here
+        let _state_guard = self.state.lock().unwrap();
+        self.rpc_manager.stop();
     }
 
     fn tick(&mut self) {
+        info!("Ticking for node {}", self.id);
         let mut state_guard = self.state.lock().unwrap();
         match state_guard.status {
             RaftNodeStatus::Leader => {
                 //  the leader should send heartbeats to all followers
+                info!("The node is a leader, sending heartbeats to all followers");
                 self.send_heartbeat();
             }
             RaftNodeStatus::Candidate | RaftNodeStatus::Follower => {
                 //  the candidate or follower should check if the election timeout has elapsed
+                info!("The node is a candidate or follower, checking election timeout");
                 self.check_election_timeout(&mut state_guard);
             }
         }
         drop(state_guard);
 
         //  listen to incoming messages from the RPC manager
-        loop {
-            self.listen_for_messages();
-            thread::sleep(Duration::from_millis(1));
-        }
+        self.listen_for_messages();
     }
 }
 
@@ -1198,7 +1232,142 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
 }
 
 #[cfg(test)]
-mod tests {
+/**
+ * All these nodes assume a single node in the cluster
+ */
+mod single_node_tests {
+    struct ClusterConfig {
+        election_timeout: Duration,
+        heartbeat_interval: Duration,
+        ports: Vec<u64>,
+    }
+
+    struct TestCluster {
+        nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
+        _config: ClusterConfig,
+    }
+
+    impl TestCluster {
+        fn tick(&mut self) {
+            info!("Ticking for the cluster");
+            self.nodes.iter_mut().for_each(|node| {
+                info!("Ticking for a node");
+                node.tick();
+            });
+        }
+
+        fn tick_by(&mut self, tick_interval: u64) {
+            for _ in 0..tick_interval {
+                //  call the tick method for the cluster here
+                self.tick();
+            }
+        }
+
+        fn advance_time_by(&mut self, duration: Duration) {
+            //  for each node in the cluster, advance it's mock clock by the duration
+            for node in &mut self.nodes {
+                match &mut node.clock {
+                    RaftNodeClock::RealClock(_) => {
+                        error!("Tests running with an actual clock! This should not be happening!")
+                    }
+                    RaftNodeClock::MockClock(ref mut mc) => mc.advance(duration),
+                }
+            }
+        }
+
+        fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
+            let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
+            let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
+            let addresses: Vec<String> = config
+                .ports
+                .iter()
+                .map(|port| format!("127.0.0.1:{}", port))
+                .collect();
+            let mut id_to_address_mapping: HashMap<ServerId, String> = HashMap::new();
+            for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+                id_to_address_mapping.insert(*node_id, address.clone());
+            }
+
+            let mut counter = 0;
+            for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+                let server_config = ServerConfig {
+                    election_timeout: config.election_timeout,
+                    heartbeat_interval: config.heartbeat_interval,
+                    address: address.clone(),
+                    port: config.ports[counter],
+                    cluster_nodes: node_ids.clone(),
+                    id_to_address_mapping: id_to_address_mapping.clone(),
+                };
+
+                let state_machine = KeyValueStore::<i32>::new();
+                let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
+                let mock_clock = RaftNodeClock::MockClock(MockClock {
+                    current_time: Instant::now(),
+                });
+
+                let node = RaftNode::new(
+                    *node_id,
+                    state_machine,
+                    server_config,
+                    node_ids.clone(),
+                    persistence_manager,
+                    mock_clock,
+                );
+                nodes.push(node);
+                counter += 1;
+            }
+            TestCluster {
+                nodes,
+                _config: config,
+            }
+        }
+
+        fn start(&mut self) {
+            for node in &mut self.nodes {
+                node.start();
+            }
+        }
+
+        fn stop(&self) {
+            for node in &self.nodes {
+                node.stop();
+            }
+        }
+
+        fn has_leader(&self) -> bool {
+            self.nodes.iter().filter(|node| node.is_leader()).count() == 1
+        }
+
+        fn get_leader(&self) -> Option<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+            self.nodes.iter().filter(|node| node.is_leader()).last()
+        }
+    }
+    use super::*;
+    use crate::ServerConfig;
+
+    const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn single_node_leader_election() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        //  create a cluster with a single node first
+        let cluster_config = ClusterConfig {
+            election_timeout: ELECTION_TIMEOUT,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            ports: vec![8000],
+        };
+        let mut cluster = TestCluster::new(1, cluster_config);
+        cluster.start();
+        cluster.advance_time_by(Duration::from_millis(255)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
+        cluster.tick_by(1);
+        cluster.stop();
+        assert_eq!(cluster.has_leader(), true);
+    }
+}
+
+#[cfg(test)]
+mod cluster_tests {
 
     use super::*;
 
