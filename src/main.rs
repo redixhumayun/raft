@@ -1,3 +1,5 @@
+#![allow(dead_code)] //  TODO: Remove this later. It's getting too noisy now.
+
 use clock::{Clock, MockClock, RealClock};
 use core::fmt;
 use serde::de::DeserializeOwned;
@@ -131,6 +133,10 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         to_address: String,
         message: RPCMessage<T>,
     ) {
+        info!(
+            "Sending a message from server {} to server {} and the message is {:?}",
+            from_server_id, to_server_id, message
+        );
         let mut stream = match TcpStream::connect(to_address) {
             Ok(stream) => stream,
             Err(e) => {
@@ -160,7 +166,7 @@ impl<T: RaftTypeTrait> RPCManager<T> {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum RPCMessage<T: Clone> {
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
@@ -1349,6 +1355,9 @@ mod single_node_tests {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 
     #[test]
+    /*
+    This test checks whether a node in a single cluster will become leader as soon as the election timeout is reached
+    */
     fn single_node_leader_election() {
         let _ = env_logger::builder().is_test(true).try_init();
         //  create a cluster with a single node first
