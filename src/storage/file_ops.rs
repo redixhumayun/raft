@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     fmt::Display,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
     str::FromStr,
 };
 
@@ -52,7 +52,6 @@ impl DirectFileOpsWriter {
 
 impl Drop for DirectFileOpsWriter {
     fn drop(&mut self) {
-        println!("Calling drop for DirectFileOpsWriter");
         match fs::remove_file(&self.file_path) {
             Ok(()) => (),
             Err(e) => {

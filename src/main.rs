@@ -315,9 +315,7 @@ enum RaftNodeClock {
 impl RaftNodeClock {
     fn advance(&mut self, duration: Duration) {
         match self {
-            RaftNodeClock::RealClock(_) => {
-                panic!("This method should never be called for a real clock");
-            }
+            RaftNodeClock::RealClock(_) => (), //  this method should do nothing for a real clock
             RaftNodeClock::MockClock(clock) => clock.advance(duration),
         }
     }
@@ -979,10 +977,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             .filter(|(_, vote_granted)| **vote_granted)
             .count();
         let quorum = self.quorum_size();
-        info!(
-            "Node has received {} votes and quorum size is {}",
-            sum_of_votes_received, quorum
-        );
         return sum_of_votes_received >= quorum;
     }
 
@@ -1060,22 +1054,40 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn reset_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
-        state_guard.last_heartbeat = Instant::now();
+        state_guard.last_heartbeat = self.clock.now();
+        // state_guard.last_heartbeat = Instant::now();
     }
 
     fn check_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        let now = self.clock.now();
+        let elapsed = now.duration_since(state_guard.last_heartbeat);
+        let elapsed_ms = elapsed.as_millis();
+        info!("Elapsed time: {} ms", elapsed_ms);
+        info!(
+            "Current time: {:?}, last heartbeat: {:?}, election timeout: {:?}",
+            self.clock.now(),
+            state_guard.last_heartbeat,
+            state_guard.election_timeout
+        );
         if (self.clock.now() - state_guard.last_heartbeat) >= state_guard.election_timeout {
             match state_guard.status {
                 RaftNodeStatus::Leader => {
                     //  do nothing
-                    //  TODO: Is this valid? Should a leader really do nothing when an election times out?
+                    info!("The node {} is a leader, do nothing", self.id);
                 }
                 RaftNodeStatus::Candidate => {
+                    info!(
+                        "Node {} was a candidate which timed out, reverting to follower and resetting election timer",
+                        self.id
+                    );
                     state_guard.status = RaftNodeStatus::Follower;
                     self.reset_election_timeout(state_guard);
                 }
                 RaftNodeStatus::Follower => {
-                    info!("Node {} timed out, starting an election", self.id);
+                    info!(
+                        "Node {} was a follower which timed out, starting a new election",
+                        self.id
+                    );
                     self.reset_election_timeout(state_guard);
                     self.start_election(state_guard);
                 }
@@ -1097,6 +1109,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     fn is_leader(&self) -> bool {
         let state_guard = self.state.lock().unwrap();
         state_guard.status == RaftNodeStatus::Leader
+    }
+
+    fn advance_time_by(&mut self, duration: Duration) {
+        self.clock.advance(duration);
     }
     //  End helper functions
 
@@ -1149,6 +1165,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn listen_for_messages(&mut self) {
         if let Ok(message) = self.from_rpc_receiver.try_recv() {
+            info!(
+                "Received following message on node {}: {:?}",
+                self.id, message
+            );
             if self.is_message_stale(message.clone()) {
                 //  dropping a stale message
                 return;
@@ -1210,6 +1230,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         //  listen to incoming messages from the RPC manager
         self.listen_for_messages();
+        self.advance_time_by(Duration::from_millis(1));
     }
 }
 
@@ -1292,9 +1313,7 @@ mod tests {
 
         impl TestCluster {
             pub fn tick(&mut self) {
-                info!("Ticking for the cluster");
                 self.nodes.iter_mut().for_each(|node| {
-                    info!("Ticking for a node");
                     node.tick();
                 });
             }
@@ -1309,14 +1328,7 @@ mod tests {
             pub fn advance_time_by(&mut self, duration: Duration) {
                 //  for each node in the cluster, advance it's mock clock by the duration
                 for node in &mut self.nodes {
-                    match &mut node.clock {
-                        RaftNodeClock::RealClock(_) => {
-                            error!(
-                                "Tests running with an actual clock! This should not be happening!"
-                            )
-                        }
-                        RaftNodeClock::MockClock(ref mut mc) => mc.advance(duration),
-                    }
+                    node.advance_time_by(duration);
                 }
             }
 
@@ -1654,6 +1666,43 @@ mod tests {
             node.restart();
             let node_state = node.state.lock().unwrap();
             assert_eq!(node_state.log.len(), 1);
+        }
+    }
+
+    mod two_node_cluster {
+        use super::common::*;
+        use super::*;
+
+        const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+        const MAX_TICKS: u64 = 100;
+
+        #[test]
+        fn leader_election() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001],
+            };
+            let mut cluster = TestCluster::new(2, cluster_config);
+            cluster.start();
+            let node = cluster.get_by_id_mut(1);
+            node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(50));
+            let mut ticks = 0;
+            loop {
+                info!("*****TICKS: {}*****", ticks);
+                if ticks >= MAX_TICKS {
+                    break;
+                }
+                if cluster.has_leader() {
+                    break;
+                }
+                cluster.tick();
+                ticks += 1;
+            }
+            cluster.stop();
+            assert_eq!(cluster.has_leader(), true);
         }
     }
 }
