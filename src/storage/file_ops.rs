@@ -1,8 +1,8 @@
 use std::{
     cell::RefCell,
     fmt::Display,
-    fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     str::FromStr,
 };
 
@@ -10,6 +10,8 @@ use crate::{
     types::{ServerId, Term},
     LogEntry, LogEntryCommand,
 };
+
+use log::info;
 
 pub trait RaftFileOps<T: Clone + FromStr + Display> {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error>;
@@ -48,6 +50,18 @@ impl DirectFileOpsWriter {
     }
 }
 
+impl Drop for DirectFileOpsWriter {
+    fn drop(&mut self) {
+        println!("Calling drop for DirectFileOpsWriter");
+        match fs::remove_file(&self.file_path) {
+            Ok(()) => (),
+            Err(e) => {
+                panic!("Error removing file: {}", e);
+            }
+        }
+    }
+}
+
 impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error> {
         // let mut file = self.file.as_ref().expect("File not found");
@@ -69,20 +83,37 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
         return Ok((term, voted_for));
     }
 
+    /// This function has been a bit of a pain. The earlier implemenation read the file using
+    /// the file param and tried to overwrite the first line but that doesn't seem to work because
+    /// a writeln function will literally just replace the bytes - so if the first line was 1,1000
+    /// and the replacement is 1,2 this will shift the 3 zeroes to the next line
+    /// The solution for now is to read the entire file into memory, modify the content and write it back
+    /// There are obviously better ways but this should be good enough for now
     fn write_term_and_voted_for(
         &self,
         term: Term,
         voted_for: Option<ServerId>,
     ) -> Result<(), io::Error> {
-        let mut binding = self.file.borrow_mut();
-        let file = binding.as_mut().expect("File not found");
-        file.seek(SeekFrom::Start(0))?;
-        if let Some(v_f) = voted_for {
-            writeln!(file, "{},{}", term, v_f)?;
+        info!(
+            "Writing term and voted_for: {} {}",
+            term,
+            voted_for.unwrap_or(100000)
+        );
+        let content = fs::read_to_string(&self.file_path)?;
+        let mut lines: Vec<&str> = content.lines().collect();
+        let new_line = format!("{},{}\n", term, voted_for.unwrap_or(100000));
+        if !lines.is_empty() {
+            lines[0] = new_line.as_str();
         } else {
-            writeln!(file, "{},{}", term, -1)?;
+            lines.push(new_line.as_str());
         }
-        file.flush()?;
+        let new_content = lines.join("\n");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        file.write_all(new_content.as_bytes())?;
         Ok(())
     }
 
@@ -240,41 +271,11 @@ mod tests {
         )?;
         let (term, voted_for) =
             <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_term_and_voted_for(&ops)?;
-        remove_file(format!("{}_server_{}", temp_file, 0))?;
+        // remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(term, 1);
         assert_eq!(voted_for, 2);
         Ok(())
     }
-
-    // #[test]
-    // fn dummy_test() -> Result<(), io::Error> {
-    //     info!("Starting dummy_test");
-    //     let _ = env_logger::try_init();
-    //     let temp_file = "temp_file";
-    //     let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
-    //     <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
-    //         &mut ops,
-    //         1,
-    //         Option::Some(2),
-    //     )?;
-
-    //     // Write a single log entry
-    //     let log_entry = LogEntry {
-    //         term: 1,
-    //         index: 1,
-    //         command: LogEntryCommand::Set,
-    //         key: "key".to_string(),
-    //         value: TestEntryData("value".to_string()),
-    //     };
-    //     ops.append_logs(&vec![log_entry])?;
-
-    //     // Flush and immediately read back the file content to inspect
-    //     let mut content = String::new();
-    //     ops.file.as_mut().unwrap().seek(SeekFrom::Start(0))?;
-    //     ops.file.as_mut().unwrap().read_to_string(&mut content)?;
-    //     println!("File content: {:?}", content);
-    //     Ok(())
-    // }
 
     #[test]
     fn test_log_entries_write_and_read() -> Result<(), io::Error> {
@@ -307,7 +308,7 @@ mod tests {
         //  read your own writes here
         let read_log_entries =
             <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
-        remove_file(format!("{}_server_{}", temp_file, 0))?;
+        // remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(log_entries.len(), read_log_entries.len());
         Ok(())
     }
@@ -397,6 +398,51 @@ mod tests {
             <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
         remove_file(format!("{}_server_{}", temp_file, 0))?;
         assert_eq!(read_log_entries.len(), 40);
+        Ok(())
+    }
+
+    #[test]
+    fn test_overwrite_term_and_voted_for_with_logs_present() -> Result<(), io::Error> {
+        info!("Starting test_log_entries_write_at_offset_and_read");
+        let _ = env_logger::try_init();
+        let temp_file = "temp_file";
+        let mut ops = DirectFileOpsWriter::new(temp_file, 0)?;
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops, 1, None,
+        )?;
+
+        //  generate a bunch of logs and write them
+        let mut log_entries: Vec<LogEntry<TestEntryData>> = Vec::new();
+        let mut log_index: u64 = 1;
+        for i in 0..100 {
+            let log_entry: LogEntry<TestEntryData> = LogEntry {
+                term: 1,
+                index: log_index,
+                command: LogEntryCommand::Set,
+                key: i.to_string(),
+                value: TestEntryData(format!("value_{}", i)),
+            };
+            log_entries.push(log_entry);
+            log_index += 1;
+        }
+        ops.append_logs(&log_entries)?;
+
+        //  read your own writes here
+        let read_log_entries =
+            <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_logs(&mut ops, 1)?;
+        assert_eq!(log_entries.len(), read_log_entries.len());
+
+        //  overwrite the term and voted for
+        <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::write_term_and_voted_for(
+            &mut ops,
+            2,
+            Some(1),
+        )?;
+        let (term, voted_for) =
+            <DirectFileOpsWriter as RaftFileOps<TestEntryData>>::read_term_and_voted_for(&ops)?;
+        assert_eq!(term, 2);
+        assert_eq!(voted_for, 1);
+
         Ok(())
     }
 }

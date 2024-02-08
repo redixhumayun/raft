@@ -405,7 +405,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        //  basic term check first
+        //  basic term check first - if the request term is lower ignore the request
         if request.term < state_guard.current_term {
             return VoteResponse {
                 term: state_guard.current_term,
@@ -517,6 +517,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         request: &AppendEntriesRequest<T>,
     ) -> AppendEntriesResponse {
         let mut state_guard = self.state.lock().unwrap();
+        info!(
+            "Received an append entries request from server {} and the request is {:?}",
+            request.leader_id, request
+        );
 
         //  the term check
         if request.term < state_guard.current_term && state_guard.status == RaftNodeStatus::Follower
@@ -643,6 +647,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  There are no subsequent logs on the follower, so no possibility of conflicts. Which means the logs can just be appended
         //  and the response can be returned
         state_guard.log.append(&mut request.entries.clone());
+        info!("Writing the log entries to file");
+        if let Err(e) = self.persistence_manager.append_logs(&request.entries) {
+            error!(
+                "There was a problem appending logs to stable storage for node {}: {}",
+                self.id, e
+            );
+        }
 
         return AppendEntriesResponse {
             server_id: self.id,
@@ -654,29 +665,15 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn handle_append_entries_response(&mut self, response: AppendEntriesResponse) {
         let mut state_guard = self.state.lock().unwrap();
-        if state_guard.current_term < response.term && !response.success {
+        if state_guard.status != RaftNodeStatus::Leader {
+            //  this node is no longer the leader. Something has changed
             return;
         }
 
         let server_index = response.server_id as usize;
 
         if !response.success {
-            //  check if the response term is greater - if it is, step down as leader and record the new term
-            if state_guard.current_term < response.term {
-                // self.update_term(&mut state_guard, response.term);
-                if let Err(e) = self
-                    .persistence_manager
-                    .write_term_and_voted_for(response.term, Option::None)
-                {
-                    error!(
-                        "There was a problem writing the term and voted_for variables to stable storage for node {}: {}",
-                        self.id, e
-                    );
-                }
-                return;
-            }
-
-            //  there isn't a new term - reduce the next index for that server and try again
+            //  reduce the next index for that server and try again
             state_guard.next_index[server_index] = state_guard.next_index[server_index]
                 .saturating_sub(1)
                 .max(1);
@@ -727,6 +724,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.current_term = new_term;
         state_guard.voted_for = None;
         state_guard.status = RaftNodeStatus::Follower;
+
+        //  TODO: Uncommenting this creates a weird condition in the file where there are two
+        //  newlines after the first line. This causes an issue on all subsequent writes.
+        //  It might be because there is a write here and then a write again from handle_vote_request().
         if let Err(e) = self
             .persistence_manager
             .write_term_and_voted_for(new_term, None)
@@ -737,7 +738,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 e
             );
         }
-        return;
     }
 
     fn retry_append_request(
@@ -986,10 +986,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         return sum_of_votes_received >= quorum;
     }
 
-    /*
-    This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
-    vote to storage and then send out messages to all other peers requesting votes
-    */
+    /// This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
+    /// vote to storage and then send out messages to all other peers requesting votes
     fn start_election(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         info!("Node {} is starting an election", self.id);
         state_guard.status = RaftNodeStatus::Candidate;
@@ -1087,7 +1085,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     //  End utility functions for main RPC's
 
     //  Helper functions
-    //  The quorum size is (N/2) + 1, where N = number of servers in the cluster
+    ///  The quorum size is (N/2) + 1, where N = number of servers in the cluster
     fn quorum_size(&self) -> usize {
         (self.config.cluster_nodes.len() / 2) + 1
     }
@@ -1112,10 +1110,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         persistence_manager: F,
         clock: RaftNodeClock,
     ) -> Self {
-        info!(
-            "Creating a new node with the following id and config: {} {:?}",
-            id, config
-        );
         let election_jitter = rand::thread_rng().gen_range(0..100);
         let election_timeout = config.election_timeout + Duration::from_millis(election_jitter);
         let server_state = RaftNodeState {
@@ -1184,8 +1178,17 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn stop(&self) {
-        let _state_guard = self.state.lock().unwrap();
+        let mut state_guard = self.state.lock().unwrap();
         self.rpc_manager.stop();
+
+        state_guard.current_term = 0;
+        state_guard.commit_index = 0;
+        state_guard.last_applied = 0;
+        state_guard.log.clear();
+        state_guard.voted_for = None;
+        state_guard.votes_received.clear();
+        state_guard.next_index.clear();
+        state_guard.match_index.clear();
     }
 
     fn tick(&mut self) {
@@ -1271,196 +1274,393 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
 }
 
 #[cfg(test)]
-/**
- * All these nodes assume a single node in the cluster
- */
-mod single_node_tests {
-    struct ClusterConfig {
-        election_timeout: Duration,
-        heartbeat_interval: Duration,
-        ports: Vec<u64>,
-    }
 
-    struct TestCluster {
-        nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
-        _config: ClusterConfig,
-    }
-
-    impl TestCluster {
-        fn tick(&mut self) {
-            info!("Ticking for the cluster");
-            self.nodes.iter_mut().for_each(|node| {
-                info!("Ticking for a node");
-                node.tick();
-            });
+mod tests {
+    use super::*;
+    mod common {
+        use super::*;
+        pub struct ClusterConfig {
+            pub election_timeout: Duration,
+            pub heartbeat_interval: Duration,
+            pub ports: Vec<u64>,
         }
 
-        fn tick_by(&mut self, tick_interval: u64) {
-            for _ in 0..tick_interval {
-                //  call the tick method for the cluster here
-                self.tick();
+        pub struct TestCluster {
+            pub nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
+            pub _config: ClusterConfig,
+        }
+
+        impl TestCluster {
+            pub fn tick(&mut self) {
+                info!("Ticking for the cluster");
+                self.nodes.iter_mut().for_each(|node| {
+                    info!("Ticking for a node");
+                    node.tick();
+                });
             }
-        }
 
-        fn advance_time_by(&mut self, duration: Duration) {
-            //  for each node in the cluster, advance it's mock clock by the duration
-            for node in &mut self.nodes {
-                match &mut node.clock {
-                    RaftNodeClock::RealClock(_) => {
-                        error!("Tests running with an actual clock! This should not be happening!")
+            pub fn tick_by(&mut self, tick_interval: u64) {
+                for _ in 0..tick_interval {
+                    //  call the tick method for the cluster here
+                    self.tick();
+                }
+            }
+
+            pub fn advance_time_by(&mut self, duration: Duration) {
+                //  for each node in the cluster, advance it's mock clock by the duration
+                for node in &mut self.nodes {
+                    match &mut node.clock {
+                        RaftNodeClock::RealClock(_) => {
+                            error!(
+                                "Tests running with an actual clock! This should not be happening!"
+                            )
+                        }
+                        RaftNodeClock::MockClock(ref mut mc) => mc.advance(duration),
                     }
-                    RaftNodeClock::MockClock(ref mut mc) => mc.advance(duration),
+                }
+            }
+
+            pub fn send_message_to_all_nodes(
+                &mut self,
+                message: RPCMessage<i32>,
+            ) -> Vec<Option<(RPCMessage<i32>, ServerId)>> {
+                //  send this message to every node
+                let mut responses: Vec<Option<(RPCMessage<i32>, ServerId)>> = Vec::new();
+                for node in &mut self.nodes {
+                    let response = node.receive(message.clone());
+                    responses.push(response);
+                }
+                return responses;
+            }
+
+            pub fn get_by_id_mut(
+                &mut self,
+                id: ServerId,
+            ) -> &mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter> {
+                self.nodes.iter_mut().find(|node| node.id == id).unwrap()
+            }
+
+            pub fn has_leader(&self) -> bool {
+                self.nodes.iter().filter(|node| node.is_leader()).count() == 1
+            }
+
+            pub fn get_leader(
+                &self,
+            ) -> Option<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes.iter().filter(|node| node.is_leader()).last()
+            }
+
+            pub fn drop_node(&mut self, id: ServerId) -> bool {
+                let old_length = self.nodes.len();
+                self.nodes.retain(|node| node.id != id);
+                return self.nodes.len() != old_length;
+            }
+
+            pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
+                let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> =
+                    Vec::new();
+                let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
+                let addresses: Vec<String> = config
+                    .ports
+                    .iter()
+                    .map(|port| format!("127.0.0.1:{}", port))
+                    .collect();
+                let mut id_to_address_mapping: HashMap<ServerId, String> = HashMap::new();
+                for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+                    id_to_address_mapping.insert(*node_id, address.clone());
+                }
+
+                let mut counter = 0;
+                for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
+                    let server_config = ServerConfig {
+                        election_timeout: config.election_timeout,
+                        heartbeat_interval: config.heartbeat_interval,
+                        address: address.clone(),
+                        port: config.ports[counter],
+                        cluster_nodes: node_ids.clone(),
+                        id_to_address_mapping: id_to_address_mapping.clone(),
+                    };
+
+                    let state_machine = KeyValueStore::<i32>::new();
+                    let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
+                    let mock_clock = RaftNodeClock::MockClock(MockClock {
+                        current_time: Instant::now(),
+                    });
+
+                    let node = RaftNode::new(
+                        *node_id,
+                        state_machine,
+                        server_config,
+                        node_ids.clone(),
+                        persistence_manager,
+                        mock_clock,
+                    );
+                    nodes.push(node);
+                    counter += 1;
+                }
+                TestCluster {
+                    nodes,
+                    _config: config,
+                }
+            }
+
+            pub fn start(&mut self) {
+                for node in &mut self.nodes {
+                    node.start();
+                }
+            }
+
+            pub fn stop(&self) {
+                for node in &self.nodes {
+                    node.stop();
                 }
             }
         }
-
-        fn send_message_to_all_nodes(
-            &mut self,
-            message: RPCMessage<i32>,
-        ) -> Vec<Option<(RPCMessage<i32>, ServerId)>> {
-            //  send this message to every node
-            let mut responses: Vec<Option<(RPCMessage<i32>, ServerId)>> = Vec::new();
-            for node in &mut self.nodes {
-                let response = node.receive(message.clone());
-                responses.push(response);
-            }
-            return responses;
-        }
-
-        fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
-            let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
-            let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
-            let addresses: Vec<String> = config
-                .ports
-                .iter()
-                .map(|port| format!("127.0.0.1:{}", port))
-                .collect();
-            let mut id_to_address_mapping: HashMap<ServerId, String> = HashMap::new();
-            for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
-                id_to_address_mapping.insert(*node_id, address.clone());
-            }
-
-            let mut counter = 0;
-            for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
-                let server_config = ServerConfig {
-                    election_timeout: config.election_timeout,
-                    heartbeat_interval: config.heartbeat_interval,
-                    address: address.clone(),
-                    port: config.ports[counter],
-                    cluster_nodes: node_ids.clone(),
-                    id_to_address_mapping: id_to_address_mapping.clone(),
-                };
-
-                let state_machine = KeyValueStore::<i32>::new();
-                let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
-                let mock_clock = RaftNodeClock::MockClock(MockClock {
-                    current_time: Instant::now(),
-                });
-
-                let node = RaftNode::new(
-                    *node_id,
-                    state_machine,
-                    server_config,
-                    node_ids.clone(),
-                    persistence_manager,
-                    mock_clock,
-                );
-                nodes.push(node);
-                counter += 1;
-            }
-            TestCluster {
-                nodes,
-                _config: config,
-            }
-        }
-
-        fn start(&mut self) {
-            for node in &mut self.nodes {
-                node.start();
-            }
-        }
-
-        fn stop(&self) {
-            for node in &self.nodes {
-                node.stop();
-            }
-        }
-
-        fn has_leader(&self) -> bool {
-            self.nodes.iter().filter(|node| node.is_leader()).count() == 1
-        }
-
-        fn get_leader(&self) -> Option<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
-            self.nodes.iter().filter(|node| node.is_leader()).last()
-        }
-    }
-    use super::*;
-    use crate::ServerConfig;
-
-    const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
-    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
-
-    #[test]
-    /*
-    This test checks whether a node in a single cluster will become leader as soon as the election timeout is reached
-    */
-    fn single_node_leader_election() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        //  create a cluster with a single node first
-        let cluster_config = ClusterConfig {
-            election_timeout: ELECTION_TIMEOUT,
-            heartbeat_interval: HEARTBEAT_INTERVAL,
-            ports: vec![8000],
-        };
-        let mut cluster = TestCluster::new(1, cluster_config);
-        cluster.start();
-        cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100 + 5)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
-        cluster.tick_by(1);
-        cluster.stop();
-        assert_eq!(cluster.has_leader(), true);
     }
 
-    #[test]
-    /**
-     * This test checks the functionality of a request vote request for a single node cluster
-     */
-    fn single_node_request_vote_request() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let cluster_config = ClusterConfig {
-            election_timeout: ELECTION_TIMEOUT,
-            heartbeat_interval: HEARTBEAT_INTERVAL,
-            ports: vec![8000],
-        };
-        let mut cluster = TestCluster::new(1, cluster_config);
-        cluster.start();
+    mod single_node_tests {
+        use super::common::*;
+        use super::*;
 
-        let request = VoteRequest {
-            term: 1,
-            candidate_id: 1,
-            last_log_index: 0,
-            last_log_term: 0,
-        };
-        let message = RPCMessage::VoteRequest(request);
+        const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 
-        let response = cluster.send_message_to_all_nodes(message);
-        assert_eq!(response.len(), 1);
-        info!("The response is: {:?}", response.get(0).unwrap());
+        /// This test checks whether a node in a single cluster will become leader as soon as the election timeout is reached
+        #[test]
+        fn leader_election() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            //  create a cluster with a single node first
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
+            cluster.start();
+            cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100 + 5)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
+            cluster.tick_by(1);
+            cluster.stop();
+            assert_eq!(cluster.has_leader(), true);
+        }
 
-        let vote_response = match response.get(0).unwrap() {
-            Some((RPCMessage::VoteResponse(response), _)) => response,
-            _ => panic!("The response is not a vote response"),
-        };
+        /// This test checks the functionality of a request vote request for a single node cluster
+        #[test]
+        fn request_vote_success() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
 
-        assert_eq!(
-            *vote_response,
-            VoteResponse {
+            let request = VoteRequest {
                 term: 1,
-                vote_granted: true,
-                candidate_id: 1
+                candidate_id: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            };
+            let message = RPCMessage::VoteRequest(request);
+
+            let response = cluster.send_message_to_all_nodes(message);
+
+            let vote_response = match response.get(0).unwrap() {
+                Some((RPCMessage::VoteResponse(response), _)) => response,
+                _ => panic!("The response is not a vote response"),
+            };
+
+            assert_eq!(
+                *vote_response,
+                VoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                    candidate_id: 1
+                }
+            );
+        }
+
+        /// This test should fail because a node receives a vote request where the log is behind its own log
+        #[test]
+        fn request_vote_fail_log_check() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
+
+            let node = cluster.get_by_id_mut(1);
+            let mut node_state = node.state.lock().unwrap();
+            node_state.current_term = 2;
+            node_state.log.push(LogEntry {
+                term: 1,
+                index: 1,
+                command: LogEntryCommand::Set,
+                key: "a".to_string(),
+                value: 1,
+            });
+            node_state.log.push(LogEntry {
+                term: 2,
+                index: 2,
+                command: LogEntryCommand::Set,
+                key: "b".to_string(),
+                value: 2,
+            });
+            drop(node_state);
+
+            let request = VoteRequest {
+                term: 1,
+                candidate_id: 1,
+                last_log_index: 1,
+                last_log_term: 1,
+            };
+            let message = RPCMessage::VoteRequest(request);
+
+            let response = cluster.send_message_to_all_nodes(message);
+            let vote_response = match response.get(0).unwrap() {
+                Some((RPCMessage::VoteResponse(response), _)) => response,
+                _ => panic!("The response is not a vote response"),
+            };
+            assert_eq!(
+                *vote_response,
+                VoteResponse {
+                    term: 2,
+                    vote_granted: false,
+                    candidate_id: 1
+                }
+            );
+        }
+
+        #[test]
+        fn append_entries_success() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
+
+            {
+                let node = cluster.get_by_id_mut(1);
+                let mut node_state = node.state.lock().unwrap();
+                node_state.current_term = 1;
+                node_state.voted_for = Some(1);
             }
-        );
+
+            let request = AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                }],
+                leader_commit_index: 1,
+            };
+            let message = RPCMessage::AppendEntriesRequest(request);
+
+            let response = cluster.send_message_to_all_nodes(message);
+            let append_response = match response.get(0).unwrap() {
+                Some((RPCMessage::AppendEntriesResponse(response), _)) => response,
+                _ => panic!("The response is not an append entries response"),
+            };
+            assert_eq!(
+                *append_response,
+                AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    server_id: 1,
+                    match_index: 1
+                }
+            );
+
+            {
+                let node = cluster.get_by_id_mut(1);
+                let node_state = node.state.lock().unwrap();
+                assert_eq!(node_state.log.len(), 1);
+            }
+        }
+
+        #[test]
+        fn restore_from_durable_storage() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
+
+            let vote_request = VoteRequest {
+                term: 1,
+                candidate_id: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            };
+            let vote_message: RPCMessage<i32> = RPCMessage::VoteRequest(vote_request);
+            let vote_response = cluster.send_message_to_all_nodes(vote_message);
+            let vote_response = match vote_response.get(0).unwrap() {
+                Some((RPCMessage::VoteResponse(response), _)) => response,
+                _ => panic!("The response is not a vote response"),
+            };
+            assert_eq!(
+                *vote_response,
+                VoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                    candidate_id: 1
+                }
+            );
+
+            let request = AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                }],
+                leader_commit_index: 1,
+            };
+            let message = RPCMessage::AppendEntriesRequest(request);
+
+            let response = cluster.send_message_to_all_nodes(message);
+            let append_response = match response.get(0).unwrap() {
+                Some((RPCMessage::AppendEntriesResponse(response), _)) => response,
+                _ => panic!("The response is not an append entries response"),
+            };
+            assert_eq!(
+                *append_response,
+                AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    server_id: 1,
+                    match_index: 1
+                }
+            );
+
+            let node = cluster.get_by_id_mut(1);
+            node.stop();
+            node.restart();
+            let node_state = node.state.lock().unwrap();
+            assert_eq!(node_state.log.len(), 1);
+        }
     }
 }
+
+/**
+ * All these nodes assume a single node in the cluster
+ */
 
 #[cfg(test)]
 mod cluster_tests {
