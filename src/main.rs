@@ -173,7 +173,39 @@ enum RPCMessage<T: Clone> {
     AppendEntriesRequest(AppendEntriesRequest<T>),
     AppendEntriesResponse(AppendEntriesResponse),
 }
-#[derive(Serialize, Deserialize, Debug, Clone)]
+
+impl PartialEq for RPCMessage<i32> {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            RPCMessage::VoteRequest(request) => {
+                if let RPCMessage::VoteRequest(other_request) = other {
+                    return request == other_request;
+                }
+                return false;
+            }
+            RPCMessage::VoteResponse(response) => {
+                if let RPCMessage::VoteResponse(other_response) = other {
+                    return response == other_response;
+                }
+                return false;
+            }
+            RPCMessage::AppendEntriesRequest(request) => {
+                if let RPCMessage::AppendEntriesRequest(other_request) = other {
+                    return request == other_request;
+                }
+                return false;
+            }
+            RPCMessage::AppendEntriesResponse(response) => {
+                if let RPCMessage::AppendEntriesResponse(other_response) = other {
+                    return response == other_response;
+                }
+                return false;
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct VoteRequest {
     term: Term,
     candidate_id: ServerId,
@@ -181,14 +213,14 @@ struct VoteRequest {
     last_log_term: Term,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct VoteResponse {
     term: Term,
     vote_granted: bool,
     candidate_id: ServerId, //  the id of the server granting the vote, used for de-duplication
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct AppendEntriesRequest<T: Clone> {
     term: Term,
     leader_id: ServerId,
@@ -198,7 +230,7 @@ struct AppendEntriesRequest<T: Clone> {
     leader_commit_index: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct AppendEntriesResponse {
     server_id: ServerId,
     term: Term,
@@ -225,7 +257,7 @@ trait StateMachine<T: Serialize + DeserializeOwned + Clone> {
     fn apply(&self, entries: Vec<LogEntry<T>>);
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 enum LogEntryCommand {
     Set = 0,
     Delete = 1,
@@ -259,7 +291,7 @@ impl fmt::Display for LogEntryCommand {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct LogEntry<T: Clone> {
     term: Term,
     index: u64,
@@ -977,6 +1009,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  Check to ensure that a single node system will be immediately elected a leader. Feels a bit hacky
         if self.can_become_leader(state_guard) {
             self.become_leader(state_guard);
+            return;
         }
 
         for peer in &self.peers {
@@ -1281,6 +1314,19 @@ mod single_node_tests {
             }
         }
 
+        fn send_message_to_all_nodes(
+            &mut self,
+            message: RPCMessage<i32>,
+        ) -> Vec<Option<(RPCMessage<i32>, ServerId)>> {
+            //  send this message to every node
+            let mut responses: Vec<Option<(RPCMessage<i32>, ServerId)>> = Vec::new();
+            for node in &mut self.nodes {
+                let response = node.receive(message.clone());
+                responses.push(response);
+            }
+            return responses;
+        }
+
         fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
             let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
             let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
@@ -1368,10 +1414,51 @@ mod single_node_tests {
         };
         let mut cluster = TestCluster::new(1, cluster_config);
         cluster.start();
-        cluster.advance_time_by(Duration::from_millis(255)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
+        cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100 + 5)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
         cluster.tick_by(1);
         cluster.stop();
         assert_eq!(cluster.has_leader(), true);
+    }
+
+    #[test]
+    /**
+     * This test checks the functionality of a request vote request for a single node cluster
+     */
+    fn single_node_request_vote_request() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let cluster_config = ClusterConfig {
+            election_timeout: ELECTION_TIMEOUT,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            ports: vec![8000],
+        };
+        let mut cluster = TestCluster::new(1, cluster_config);
+        cluster.start();
+
+        let request = VoteRequest {
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let message = RPCMessage::VoteRequest(request);
+
+        let response = cluster.send_message_to_all_nodes(message);
+        assert_eq!(response.len(), 1);
+        info!("The response is: {:?}", response.get(0).unwrap());
+
+        let vote_response = match response.get(0).unwrap() {
+            Some((RPCMessage::VoteResponse(response), _)) => response,
+            _ => panic!("The response is not a vote response"),
+        };
+
+        assert_eq!(
+            *vote_response,
+            VoteResponse {
+                term: 1,
+                vote_granted: true,
+                candidate_id: 1
+            }
+        );
     }
 }
 
