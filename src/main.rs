@@ -300,7 +300,7 @@ struct LogEntry<T: Clone> {
     value: T,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum RaftNodeStatus {
     Leader,
     Candidate,
@@ -681,8 +681,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         //  the response is successful
-        state_guard.next_index[response.server_id as usize] = response.match_index + 1;
-        state_guard.match_index[response.server_id as usize] = response.match_index;
+        //  subtracting 1 from server_id because it is 1-based
+        state_guard.next_index[(response.server_id - 1) as usize] = response.match_index + 1;
+        state_guard.match_index[(response.server_id - 1) as usize] = response.match_index;
         self.advance_commit_index(&mut state_guard);
         self.apply_entries(&mut state_guard);
         return;
@@ -707,6 +708,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         /\ UNCHANGED <<messages, currentTerm, votedFor, candidateVars, logVars>>
     */
     fn become_leader(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        info!("Node {} has become the leader", self.id);
         state_guard.status = RaftNodeStatus::Leader;
         let last_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
         state_guard.next_index = self
@@ -819,7 +821,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 count >= self.quorum_size().try_into().unwrap()
                     && state_guard
                         .log
-                        .get((index - 1) as usize)
+                        .get((index as usize).saturating_sub(1))
                         .map_or(false, |entry| entry.term == state_guard.current_term)
             })
             .map(|(&match_index, _)| match_index)
@@ -977,7 +979,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             .filter(|(_, vote_granted)| **vote_granted)
             .count();
         let quorum = self.quorum_size();
-        return sum_of_votes_received >= quorum;
+        let result = sum_of_votes_received >= quorum;
+        info!("Node {} can become leader: {}", self.id, result);
+        return result;
     }
 
     /// This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
@@ -1024,8 +1028,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
     }
 
-    fn send_heartbeat(&self) {
-        let state_guard = self.state.lock().unwrap();
+    fn send_heartbeat(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) {
         if state_guard.status != RaftNodeStatus::Leader {
             return;
         }
@@ -1035,11 +1038,12 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 //  ignore self referencing node
                 continue;
             }
+
             let heartbeat_request = AppendEntriesRequest {
                 term: state_guard.current_term,
                 leader_id: self.id,
-                prev_log_index: state_guard.log.last().unwrap().index,
-                prev_log_term: state_guard.log.last().unwrap().term,
+                prev_log_index: state_guard.log.last().map_or(0, |entry| entry.term),
+                prev_log_term: state_guard.log.last().map_or(0, |entry| entry.index),
                 entries: Vec::<LogEntry<T>>::new(),
                 leader_commit_index: state_guard.commit_index,
             };
@@ -1055,39 +1059,26 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn reset_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         state_guard.last_heartbeat = self.clock.now();
-        // state_guard.last_heartbeat = Instant::now();
     }
 
     fn check_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
-        let now = self.clock.now();
-        let elapsed = now.duration_since(state_guard.last_heartbeat);
-        let elapsed_ms = elapsed.as_millis();
-        info!("Elapsed time: {} ms", elapsed_ms);
-        info!(
-            "Current time: {:?}, last heartbeat: {:?}, election timeout: {:?}",
-            self.clock.now(),
-            state_guard.last_heartbeat,
-            state_guard.election_timeout
-        );
         if (self.clock.now() - state_guard.last_heartbeat) >= state_guard.election_timeout {
+            info!("Node {} has timed out", self.id);
             match state_guard.status {
                 RaftNodeStatus::Leader => {
                     //  do nothing
-                    info!("The node {} is a leader, do nothing", self.id);
+                    info!("Node {} is still the leader", self.id);
                 }
                 RaftNodeStatus::Candidate => {
                     info!(
-                        "Node {} was a candidate which timed out, reverting to follower and resetting election timer",
+                        "Node {} was a candidate. Giving up on the election",
                         self.id
                     );
                     state_guard.status = RaftNodeStatus::Follower;
                     self.reset_election_timeout(state_guard);
                 }
                 RaftNodeStatus::Follower => {
-                    info!(
-                        "Node {} was a follower which timed out, starting a new election",
-                        self.id
-                    );
+                    info!("Node {} was a follower. Starting an election", self.id);
                     self.reset_election_timeout(state_guard);
                     self.start_election(state_guard);
                 }
@@ -1165,10 +1156,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn listen_for_messages(&mut self) {
         if let Ok(message) = self.from_rpc_receiver.try_recv() {
-            info!(
-                "Received following message on node {}: {:?}",
-                self.id, message
-            );
+            info!("Received a message on node {}: {:?}", self.id, message);
             if self.is_message_stale(message.clone()) {
                 //  dropping a stale message
                 return;
@@ -1212,17 +1200,14 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn tick(&mut self) {
-        info!("Ticking for node {}", self.id);
         let mut state_guard = self.state.lock().unwrap();
         match state_guard.status {
             RaftNodeStatus::Leader => {
                 //  the leader should send heartbeats to all followers
-                info!("The node is a leader, sending heartbeats to all followers");
-                self.send_heartbeat();
+                self.send_heartbeat(&state_guard);
             }
             RaftNodeStatus::Candidate | RaftNodeStatus::Follower => {
                 //  the candidate or follower should check if the election timeout has elapsed
-                info!("The node is a candidate or follower, checking election timeout");
                 self.check_election_timeout(&mut state_guard);
             }
         }
@@ -1316,6 +1301,10 @@ mod tests {
                 self.nodes.iter_mut().for_each(|node| {
                     node.tick();
                 });
+                // since i am not mocking the network layer in tests, i need this for now to
+                // simulate actual passage of time so that the TCP layer can actually deliver the
+                // message
+                thread::sleep(Duration::from_millis(10));
             }
 
             pub fn tick_by(&mut self, tick_interval: u64) {
@@ -1366,6 +1355,21 @@ mod tests {
                 let old_length = self.nodes.len();
                 self.nodes.retain(|node| node.id != id);
                 return self.nodes.len() != old_length;
+            }
+
+            pub fn wait_for_stable_leader(&mut self, max_ticks: u64) -> bool {
+                let mut ticks = 0;
+                loop {
+                    if ticks >= max_ticks {
+                        break;
+                    }
+                    if self.has_leader() {
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                return false;
             }
 
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
@@ -1430,12 +1434,13 @@ mod tests {
         }
     }
 
-    mod single_node_tests {
+    mod single_node_cluster {
         use super::common::*;
         use super::*;
 
         const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+        const MAX_TICKS: u64 = 100;
 
         /// This test checks whether a node in a single cluster will become leader as soon as the election timeout is reached
         #[test]
@@ -1667,6 +1672,45 @@ mod tests {
             let node_state = node.state.lock().unwrap();
             assert_eq!(node_state.log.len(), 1);
         }
+
+        /// This test will determine whether a leader correctly advances its commit index
+        /// based on the list of match indexes it maintains for each follower
+        #[test]
+        fn advance_commit_index_of_leader() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let mut cluster = TestCluster::new(1, cluster_config);
+            cluster.start();
+            cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(50));
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            assert_eq!(cluster.has_leader(), true);
+            let leader_node = cluster.get_leader().unwrap();
+            {
+                let mut state_guard = leader_node.state.lock().unwrap();
+                state_guard.log.push(LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                });
+                state_guard.log.push(LogEntry {
+                    term: 1,
+                    index: 2,
+                    command: LogEntryCommand::Set,
+                    key: "b".to_string(),
+                    value: 2,
+                });
+                state_guard.commit_index = 0;
+                state_guard.match_index = vec![2];
+                leader_node.advance_commit_index(&mut state_guard);
+                assert_eq!(state_guard.commit_index, 2);
+            }
+        }
     }
 
     mod two_node_cluster {
@@ -1677,6 +1721,8 @@ mod tests {
         const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
         const MAX_TICKS: u64 = 100;
 
+        /// Assert that in a 2-node cluster, the more advanced node becomes leader
+        /// after a few ticks
         #[test]
         fn leader_election() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -1689,20 +1735,44 @@ mod tests {
             cluster.start();
             let node = cluster.get_by_id_mut(1);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(50));
+            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
+            cluster.stop();
+            assert_eq!(leader_election_result, true);
+            assert_eq!(cluster.has_leader(), true);
+        }
+
+        /// This test will detemrine whether an elected leader sends heartbeats regularly during its term
+        /// It does so by checking that the leader and term haven't changed after the iterations are done
+        /// This indicates that a leader regularly sent heartbeats which prevented an election timeout
+        #[test]
+        fn leader_send_heartbeats() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001],
+            };
+            let mut cluster = TestCluster::new(2, cluster_config);
+            cluster.start();
+            let node = cluster.get_by_id_mut(1);
+            node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
+            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
+            assert_eq!(leader_election_result, true);
+            assert_eq!(cluster.has_leader(), true);
+            let leader = cluster.get_leader().unwrap();
+            let leader_term = leader.state.lock().unwrap().current_term;
             let mut ticks = 0;
             loop {
-                info!("*****TICKS: {}*****", ticks);
                 if ticks >= MAX_TICKS {
-                    break;
-                }
-                if cluster.has_leader() {
                     break;
                 }
                 cluster.tick();
                 ticks += 1;
             }
+            let new_leader = cluster.get_leader().unwrap();
+            let new_leader_term = new_leader.state.lock().unwrap().current_term;
             cluster.stop();
-            assert_eq!(cluster.has_leader(), true);
+            assert_eq!(new_leader_term, leader_term);
         }
     }
 }

@@ -93,11 +93,6 @@ impl<T: Clone + FromStr + Display> RaftFileOps<T> for DirectFileOpsWriter {
         term: Term,
         voted_for: Option<ServerId>,
     ) -> Result<(), io::Error> {
-        info!(
-            "Writing term and voted_for: {} {}",
-            term,
-            voted_for.unwrap_or(100000)
-        );
         let content = fs::read_to_string(&self.file_path)?;
         let mut lines: Vec<&str> = content.lines().collect();
         let new_line = format!("{},{}\n", term, voted_for.unwrap_or(100000));
