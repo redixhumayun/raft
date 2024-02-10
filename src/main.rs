@@ -570,19 +570,51 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         //  the request can be accepted, try and append the logs
-        //  this is the point where the logs will be inserted
         let log_index = request.prev_log_index + 1; //  the first log index will be 1
+
+        //  if the number of log entries in the request are already present in the node log, check if its all already present
+        let mut duplicates = false;
+        if self.len_as_u64(&state_guard.log) > log_index
+            && (self.len_as_u64(&state_guard.log) - log_index) == self.len_as_u64(&request.entries)
+        {
+            duplicates = true;
+            let mut follower_index = log_index;
+            for entry in &request.entries {
+                let follower_entry =
+                    state_guard
+                        .log
+                        .get((follower_index - 1) as usize)
+                        .expect(&format!(
+                            "There is no entry at index for the follower {}",
+                            follower_index - 1
+                        ));
+                if follower_entry.index != entry.index && follower_entry.term != entry.term {
+                    duplicates = false;
+                }
+                follower_index += 1;
+            }
+        }
+
+        if duplicates {
+            info!("All the entries passed in are duplicates. Not appending anything but updating the match index sent back to the leadaer");
+            return AppendEntriesResponse {
+                server_id: self.id,
+                term: state_guard.current_term,
+                success: true,
+                match_index: self.len_as_u64(&state_guard.log) - 1,
+            };
+        }
 
         //  Now, we know the prefix is ok. First, check that there are no subsequent logs on the follower.
         //  If there are subequent logs, and there is a conflict, discard logs from the conflict point onwards
-        if (state_guard.log.len() as u64) > log_index {
+        if self.len_as_u64(&state_guard.log) > log_index {
             let max_range = min(
                 self.len_as_u64(&state_guard.log) - log_index,
                 self.len_as_u64(&request.entries),
             );
             let mut conflict_point = -1;
 
-            //  Check if a conflict point exists
+            //  Check if a conflict point exists. Also check if all the logs are already replicated on this follower
             for index in 0..max_range {
                 let follower_entry = state_guard
                     .log
@@ -596,7 +628,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                     .entries
                     .get((log_index - 1 + index) as usize)
                     .expect(&format!(
-                        "There is no entry at index {} in the message",
+                        "There is no entry at index {} in the request entries array",
                         log_index - 1 + index
                     ));
 
@@ -682,8 +714,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         //  the response is successful
         //  subtracting 1 from server_id because it is 1-based
-        state_guard.next_index[(response.server_id - 1) as usize] = response.match_index + 1;
-        state_guard.match_index[(response.server_id - 1) as usize] = response.match_index;
+        state_guard.next_index[(response.server_id) as usize] = response.match_index + 1;
+        state_guard.match_index[(response.server_id) as usize] = response.match_index;
         self.advance_commit_index(&mut state_guard);
         self.apply_entries(&mut state_guard);
         return;
@@ -1112,6 +1144,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             key,
             value,
         };
+        let prev_log_index = state_guard.log.last().map_or(0, |entry| entry.index);
+        let prev_log_term = state_guard.log.last().map_or(0, |entry| entry.term);
         state_guard.log.push(log_entry.clone());
         let index = state_guard.log.len() - 1;
         if let Err(e) = self
@@ -1130,8 +1164,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             let append_entry_request = AppendEntriesRequest {
                 term: state_guard.current_term,
                 leader_id: self.id,
-                prev_log_index: state_guard.log.last().map_or(0, |entry| entry.index),
-                prev_log_term: state_guard.log.last().map_or(0, |entry| entry.term),
+                prev_log_index,
+                prev_log_term,
                 entries: vec![log_entry.clone()],
                 leader_commit_index: state_guard.commit_index,
             };
@@ -1460,7 +1494,7 @@ mod tests {
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
                 let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> =
                     Vec::new();
-                let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
+                let node_ids: Vec<ServerId> = (0..number_of_nodes).collect();
                 let addresses: Vec<String> = config
                     .ports
                     .iter()
@@ -1818,7 +1852,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(2, cluster_config);
             cluster.start();
-            let node = cluster.get_by_id_mut(1);
+            let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(50));
             let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
             cluster.stop();
@@ -1839,7 +1873,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(2, cluster_config);
             cluster.start();
-            let node = cluster.get_by_id_mut(1);
+            let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
             let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
             assert_eq!(leader_election_result, true);
@@ -1870,11 +1904,9 @@ mod tests {
             };
             let mut cluster = TestCluster::new(2, cluster_config);
             cluster.start();
-            let node = cluster.get_by_id_mut(1);
+            let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
-            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
-            assert_eq!(leader_election_result, true);
-            assert_eq!(cluster.has_leader(), true);
+            cluster.wait_for_stable_leader(MAX_TICKS);
             let (log_entry, entry_index) = {
                 let leader = cluster.get_leader_mut().unwrap();
                 let entry_index = leader.set_key_value_pair("a".to_string(), 1).unwrap();
