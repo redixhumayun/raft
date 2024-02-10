@@ -1085,6 +1085,65 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             }
         }
     }
+
+    fn get_log_entry_at(
+        &self,
+        state_guard: &MutexGuard<'_, RaftNodeState<T>>,
+        log_entry_index: u32,
+    ) -> LogEntry<T> {
+        let log_entry = state_guard.log.get(log_entry_index as usize).unwrap();
+        return log_entry.clone();
+    }
+
+    fn get_last_log_entry(&self) -> LogEntry<T> {
+        let state_guard = self.state.lock().unwrap();
+        return self.get_log_entry_at(&state_guard, state_guard.log.len() as u32 - 1);
+    }
+
+    fn set_key_value_pair(&mut self, key: String, value: T) -> Result<usize, String> {
+        if !self.is_leader() {
+            return Err("This node is not the leader".to_string());
+        }
+        let mut state_guard = self.state.lock().unwrap();
+        let log_entry = LogEntry {
+            term: state_guard.current_term,
+            index: state_guard.log.last().map_or(1, |entry| entry.index + 1),
+            command: LogEntryCommand::Set,
+            key,
+            value,
+        };
+        state_guard.log.push(log_entry.clone());
+        let index = state_guard.log.len() - 1;
+        if let Err(e) = self
+            .persistence_manager
+            .append_logs(&vec![log_entry.clone()])
+        {
+            return Err(format!(
+                "There was an error while appending logs to stable storage {}",
+                e
+            ));
+        }
+        for peer in &self.peers {
+            if *peer == self.id {
+                continue;
+            }
+            let append_entry_request = AppendEntriesRequest {
+                term: state_guard.current_term,
+                leader_id: self.id,
+                prev_log_index: state_guard.log.last().map_or(0, |entry| entry.index),
+                prev_log_term: state_guard.log.last().map_or(0, |entry| entry.term),
+                entries: vec![log_entry.clone()],
+                leader_commit_index: state_guard.commit_index,
+            };
+            let message = RPCMessage::<T>::AppendEntriesRequest(append_entry_request);
+            let to_address = self.config.id_to_address_mapping.get(peer).expect(
+                format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
+            );
+            self.rpc_manager
+                .send_message(self.id, *peer, to_address.clone(), message);
+        }
+        Ok(index)
+    }
     //  End utility functions for main RPC's
 
     //  Helper functions
@@ -1351,6 +1410,12 @@ mod tests {
                 self.nodes.iter().filter(|node| node.is_leader()).last()
             }
 
+            pub fn get_leader_mut(
+                &mut self,
+            ) -> Option<&mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes.iter_mut().filter(|node| node.is_leader()).last()
+            }
+
             pub fn drop_node(&mut self, id: ServerId) -> bool {
                 let old_length = self.nodes.len();
                 self.nodes.retain(|node| node.id != id);
@@ -1370,6 +1435,26 @@ mod tests {
                     ticks += 1;
                 }
                 return false;
+            }
+
+            pub fn wait_until_entry_applied(
+                &mut self,
+                log_entry: LogEntry<i32>,
+                expected_index: usize,
+                max_ticks: u64,
+            ) -> bool {
+                let mut ticks = 0;
+                while ticks < max_ticks {
+                    if self.nodes.iter().all(|node| {
+                        let state_guard = node.state.lock().unwrap();
+                        state_guard.log.get(expected_index) == Some(&log_entry)
+                    }) {
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                false
             }
 
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
@@ -1741,7 +1826,7 @@ mod tests {
             assert_eq!(cluster.has_leader(), true);
         }
 
-        /// This test will detemrine whether an elected leader sends heartbeats regularly during its term
+        /// This test will determine whether an elected leader sends heartbeats regularly during its term
         /// It does so by checking that the leader and term haven't changed after the iterations are done
         /// This indicates that a leader regularly sent heartbeats which prevented an election timeout
         #[test]
@@ -1773,6 +1858,41 @@ mod tests {
             let new_leader_term = new_leader.state.lock().unwrap().current_term;
             cluster.stop();
             assert_eq!(new_leader_term, leader_term);
+        }
+
+        #[test]
+        fn apply_entries() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001],
+            };
+            let mut cluster = TestCluster::new(2, cluster_config);
+            cluster.start();
+            let node = cluster.get_by_id_mut(1);
+            node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
+            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
+            assert_eq!(leader_election_result, true);
+            assert_eq!(cluster.has_leader(), true);
+            let (log_entry, entry_index) = {
+                let leader = cluster.get_leader_mut().unwrap();
+                let entry_index = leader.set_key_value_pair("a".to_string(), 1).unwrap();
+                let log_entry = LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                };
+                let leader_state = leader.state.lock().unwrap();
+                assert_eq!(leader_state.log.len(), 1);
+                assert_eq!(leader_state.log.get(0), Some(&log_entry));
+                (log_entry, entry_index)
+            };
+            let result = cluster.wait_until_entry_applied(log_entry, entry_index, MAX_TICKS);
+            assert_eq!(result, true);
+            cluster.stop();
         }
     }
 }
