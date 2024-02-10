@@ -11,8 +11,6 @@ use crate::{
     LogEntry, LogEntryCommand,
 };
 
-use log::info;
-
 pub trait RaftFileOps<T: Clone + FromStr + Display> {
     fn read_term_and_voted_for(&self) -> Result<(Term, ServerId), io::Error>;
     fn write_term_and_voted_for(

@@ -558,6 +558,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             state_guard.status = RaftNodeStatus::Follower;
         }
 
+        //  update the commit index on this node and apply all pending entries
+        state_guard.commit_index = request.leader_commit_index;
+        self.apply_entries(&mut state_guard);
+
         //  heartbeat check - register the heartbeat time
         if request.entries.len() == 0 {
             self.reset_election_timeout(&mut state_guard);
@@ -864,12 +868,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
     }
 
-    /**
-     * This function will move the last_applied to make it catch up with commit_index and apply all the entries in that range
-     * to the state machine
-     */
+    /// This function will check whether there are any more entries that can be applied to the state machine for the node
     fn apply_entries(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
-        assert!(state_guard.status == RaftNodeStatus::Leader);
         let mut entries_to_apply: Vec<LogEntry<T>> = Vec::new();
         while state_guard.last_applied < state_guard.commit_index {
             state_guard.last_applied += 1;
