@@ -7,7 +7,6 @@ use serde_json;
 use std::cell::RefCell;
 use std::cmp::min;
 use std::io::{self, BufRead, Write};
-use std::marker::PhantomData;
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
@@ -901,14 +900,12 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         */
     fn advance_commit_index(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         assert!(state_guard.status == RaftNodeStatus::Leader);
-        info!("Advancing the commit index of the leader");
+
         //  find all match indexes that have quorum
         let mut match_index_count: HashMap<u64, u64> = HashMap::new();
         for &server_match_index in &state_guard.match_index {
-            info!("The match index is {}", server_match_index);
             *match_index_count.entry(server_match_index).or_insert(0) += 1;
         }
-        info!("The match index count is {:?}", match_index_count);
 
         let new_commit_index = match_index_count
             .iter()
@@ -922,10 +919,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             .map(|(&match_index, _)| match_index)
             .max();
 
-        info!(
-            "The new commit index of the leader is {:?}",
-            new_commit_index
-        );
         if let Some(max_index) = new_commit_index {
             state_guard.commit_index = max_index;
         }
