@@ -1174,6 +1174,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
     }
 
+    /// Returns the log entry at a given index
     fn get_log_entry_at(
         &self,
         state_guard: &MutexGuard<'_, RaftNodeState<T>>,
@@ -1183,11 +1184,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         return log_entry.clone();
     }
 
+    /// Returns the last log entry
     fn get_last_log_entry(&self) -> LogEntry<T> {
         let state_guard = self.state.lock().unwrap();
         return self.get_log_entry_at(&state_guard, state_guard.log.len() as u32 - 1);
     }
 
+    /// Method exposed by the node to allow a client to set a key value pair on the state machine
     fn set_key_value_pair(&mut self, key: String, value: T) -> Result<usize, String> {
         if !self.is_leader() {
             return Err("This node is not the leader".to_string());
