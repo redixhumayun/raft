@@ -164,6 +164,9 @@ impl<T: RaftTypeTrait> RPCManager<T> {
                         }
                     }
                     Err(e) => {
+                        if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
                         error!("There was an error while accepting a connection {}", e);
                     }
                 }
@@ -1270,6 +1273,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     //  From this point onward are all the starter methods to bring the node up and handle communication
     //  between the node and the RPC manager
+
+    /// Method to construct a new raft node
     fn new(
         id: ServerId,
         state_machine: S,
@@ -1349,6 +1354,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     fn stop(&self) {
         let mut state_guard = self.state.lock().unwrap();
         self.rpc_manager.stop();
+        let address = &self.config.address;
+        let _ = TcpStream::connect(address);
 
         state_guard.current_term = 0;
         state_guard.commit_index = 0;
@@ -1849,8 +1856,9 @@ mod tests {
             let node = cluster.get_by_id_mut(0);
             node.stop();
             node.restart();
-            let node_state = node.state.lock().unwrap();
-            assert_eq!(node_state.log.len(), 1);
+            let log_length = node.state.lock().unwrap().log.len();
+            cluster.stop();
+            assert_eq!(log_length, 1);
         }
 
         /// This test will determine whether a leader correctly advances its commit index
