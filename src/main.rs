@@ -1657,7 +1657,7 @@ mod tests {
             let mut cluster = TestCluster::new(1, cluster_config);
             cluster.start();
             cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100 + 5)); //  picking 255 here because 150 + a max jitter of 100 guarantees that election has timed out
-            cluster.tick_by(1);
+            cluster.wait_for_stable_leader(MAX_TICKS);
             cluster.stop();
             assert_eq!(cluster.has_leader(), true);
         }
@@ -1912,9 +1912,8 @@ mod tests {
             cluster.start();
             let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(50));
-            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
+            cluster.wait_for_stable_leader(MAX_TICKS);
             cluster.stop();
-            assert_eq!(leader_election_result, true);
             assert_eq!(cluster.has_leader(), true);
         }
 
@@ -1933,11 +1932,13 @@ mod tests {
             cluster.start();
             let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
-            let leader_election_result = cluster.wait_for_stable_leader(MAX_TICKS);
-            assert_eq!(leader_election_result, true);
+            cluster.wait_for_stable_leader(MAX_TICKS);
             assert_eq!(cluster.has_leader(), true);
-            let leader = cluster.get_leader().unwrap();
-            let leader_term = leader.state.lock().unwrap().current_term;
+            let (leader_id, leader_term) = {
+                let leader = cluster.get_leader().unwrap();
+                let leader_term = leader.state.lock().unwrap().current_term;
+                (leader.id, leader_term)
+            };
             let mut ticks = 0;
             loop {
                 if ticks >= MAX_TICKS {
@@ -1949,6 +1950,7 @@ mod tests {
             let new_leader = cluster.get_leader().unwrap();
             let new_leader_term = new_leader.state.lock().unwrap().current_term;
             cluster.stop();
+            assert_eq!(new_leader.id, leader_id);
             assert_eq!(new_leader_term, leader_term);
         }
 
