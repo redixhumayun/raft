@@ -32,13 +32,69 @@ use storage::{DirectFileOpsWriter, RaftFileOps};
  * RPC Stuff
  */
 
+trait Communication<T: RaftTypeTrait> {
+    fn send_message(
+        &self,
+        from_server_id: ServerId,
+        to_server_id: ServerId,
+        to_address: String,
+        message: RPCMessage<T>,
+    );
+}
+
+struct MockMessage<T: RaftTypeTrait> {
+    from_node_id: ServerId,
+    to_node_id: ServerId,
+    message: RPCMessage<T>,
+}
+
+struct MockRPCManager<T: RaftTypeTrait> {
+    server_id: ServerId,
+    to_node_sender: mpsc::Sender<RPCMessage<T>>,
+    sent_messages: RefCell<Vec<MockMessage<T>>>,
+}
+
+impl<T: RaftTypeTrait> MockRPCManager<T> {
+    fn new(server_id: ServerId, to_node_sender: mpsc::Sender<RPCMessage<T>>) -> Self {
+        MockRPCManager {
+            server_id,
+            to_node_sender,
+            sent_messages: RefCell::new(vec![]),
+        }
+    }
+
+    fn start(&self) {
+        info!("Starting the mock rpc manager");
+    }
+
+    fn stop(&self) {
+        info!("Stopping the mock rpc manager");
+    }
+}
+
+impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
+    fn send_message(
+        &self,
+        from_server_id: ServerId,
+        to_server_id: ServerId,
+        _to_address: String,
+        message: RPCMessage<T>,
+    ) {
+        let mock_message = MockMessage {
+            from_node_id: from_server_id,
+            to_node_id: to_server_id,
+            message,
+        };
+        self.sent_messages.borrow_mut().push(mock_message);
+    }
+}
+
 struct RPCManager<T: RaftTypeTrait> {
     server_id: ServerId,
     server_address: String,
     port: u64,
     to_node_sender: mpsc::Sender<RPCMessage<T>>,
     is_running: Arc<AtomicBool>,
-    _marker: PhantomData<T>,
 }
 
 impl<T: RaftTypeTrait> RPCManager<T> {
@@ -54,7 +110,6 @@ impl<T: RaftTypeTrait> RPCManager<T> {
             port,
             to_node_sender,
             is_running: Arc::new(AtomicBool::new(false)),
-            _marker: PhantomData,
         }
     }
 
@@ -121,7 +176,9 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
 
+impl<T: RaftTypeTrait> Communication<T> for RPCManager<T> {
     /**
      * This method is called from the raft node to allow it to communicate with other nodes
      * via the RPC manager.
@@ -253,7 +310,7 @@ struct ServerConfig {
 
 trait StateMachine<T: Serialize + DeserializeOwned + Clone> {
     fn apply_set(&self, key: String, value: T);
-    fn apply_get(&self, key: String) -> Option<T>;
+    fn apply_get(&self, key: &str) -> Option<T>;
     fn apply(&self, entries: Vec<LogEntry<T>>);
 }
 
@@ -699,8 +756,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn handle_append_entries_response(&mut self, response: AppendEntriesResponse) {
         let mut state_guard = self.state.lock().unwrap();
+        info!("Handling the response");
         if state_guard.status != RaftNodeStatus::Leader {
-            //  this node is no longer the leader. Something has changed
             return;
         }
 
@@ -717,7 +774,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         //  the response is successful
-        //  subtracting 1 from server_id because it is 1-based
+        info!(
+            "The response was successful, updating next index and match index for server {} and the response is {:?}",
+            response.server_id, response
+        );
         state_guard.next_index[(response.server_id) as usize] = response.match_index + 1;
         state_guard.match_index[(response.server_id) as usize] = response.match_index;
         self.advance_commit_index(&mut state_guard);
@@ -761,9 +821,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.voted_for = None;
         state_guard.status = RaftNodeStatus::Follower;
 
-        //  TODO: Uncommenting this creates a weird condition in the file where there are two
-        //  newlines after the first line. This causes an issue on all subsequent writes.
-        //  It might be because there is a write here and then a write again from handle_vote_request().
         if let Err(e) = self
             .persistence_manager
             .write_term_and_voted_for(new_term, None)
@@ -844,25 +901,31 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         */
     fn advance_commit_index(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         assert!(state_guard.status == RaftNodeStatus::Leader);
-
+        info!("Advancing the commit index of the leader");
         //  find all match indexes that have quorum
         let mut match_index_count: HashMap<u64, u64> = HashMap::new();
         for &server_match_index in &state_guard.match_index {
+            info!("The match index is {}", server_match_index);
             *match_index_count.entry(server_match_index).or_insert(0) += 1;
         }
+        info!("The match index count is {:?}", match_index_count);
 
         let new_commit_index = match_index_count
             .iter()
-            .filter(|(&index, &count)| {
+            .filter(|(&match_index, &count)| {
                 count >= self.quorum_size().try_into().unwrap()
                     && state_guard
                         .log
-                        .get((index as usize).saturating_sub(1))
+                        .get((match_index as usize).saturating_sub(1))
                         .map_or(false, |entry| entry.term == state_guard.current_term)
             })
             .map(|(&match_index, _)| match_index)
             .max();
 
+        info!(
+            "The new commit index of the leader is {:?}",
+            new_commit_index
+        );
         if let Some(max_index) = new_commit_index {
             state_guard.commit_index = max_index;
         }
@@ -1181,7 +1244,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     //  End utility functions for main RPC's
 
     //  Helper functions
-    ///  The quorum size is (N/2) + 1, where N = number of servers in the cluster
+    ///  The quorum size is (N/2) + 1, where N = number of servers in the cluster and N is odd
     fn quorum_size(&self) -> usize {
         (self.config.cluster_nodes.len() / 2) + 1
     }
@@ -1197,6 +1260,15 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn advance_time_by(&mut self, duration: Duration) {
         self.clock.advance(duration);
+    }
+
+    fn query_state_machine<'a>(&'a self, keys: &Vec<&'a str>) -> Vec<(&str, Option<T>)> {
+        let mut results: Vec<(&str, Option<T>)> = vec![];
+        for key in keys {
+            let result = self.state_machine.apply_get(key);
+            results.push((key, result));
+        }
+        return results;
     }
     //  End helper functions
 
@@ -1361,8 +1433,8 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
         self.store.borrow_mut().insert(key, value);
     }
 
-    fn apply_get(&self, key: String) -> Option<T> {
-        return self.store.borrow().get(&key).cloned();
+    fn apply_get(&self, key: &str) -> Option<T> {
+        return self.store.borrow().get(key).cloned();
     }
 
     fn apply(&self, entries: Vec<LogEntry<T>>) {
@@ -1473,22 +1545,40 @@ mod tests {
 
             pub fn wait_until_entry_applied(
                 &mut self,
-                log_entry: LogEntry<i32>,
+                log_entry: &LogEntry<i32>,
                 expected_index: usize,
                 max_ticks: u64,
             ) -> bool {
                 let mut ticks = 0;
                 while ticks < max_ticks {
-                    if self.nodes.iter().all(|node| {
+                    let is_in_log = self.nodes.iter().all(|node| {
                         let state_guard = node.state.lock().unwrap();
                         state_guard.log.get(expected_index) == Some(&log_entry)
-                    }) {
+                    });
+                    // let key = &log_entry.key;
+                    // let is_applied = self
+                    //     .nodes
+                    //     .iter()
+                    //     .all(|node| node.state_machine.apply_get(key).is_some());
+                    if is_in_log {
                         return true;
                     }
                     self.tick();
                     ticks += 1;
                 }
                 false
+            }
+
+            pub fn query_state_machine_across_nodes<'a>(
+                &'a self,
+                keys: Vec<&'a str>,
+            ) -> HashMap<ServerId, Vec<(&str, Option<i32>)>> {
+                let mut hm: HashMap<ServerId, Vec<(&str, Option<i32>)>> = HashMap::new();
+                for node in &self.nodes {
+                    let key_value_pairs = node.query_state_machine(&keys);
+                    hm.insert(node.id, key_value_pairs);
+                }
+                hm
             }
 
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
@@ -1894,6 +1984,8 @@ mod tests {
             assert_eq!(new_leader_term, leader_term);
         }
 
+        /// This test will determine whether an elected leader will correctly send a key-value pair it receives from a client
+        /// to all its followers. The leader should also append the entry to its own log before that.
         #[test]
         fn apply_entries() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -1922,10 +2014,14 @@ mod tests {
                 assert_eq!(leader_state.log.get(0), Some(&log_entry));
                 (log_entry, entry_index)
             };
-            let result = cluster.wait_until_entry_applied(log_entry, entry_index, MAX_TICKS);
+            let result = cluster.wait_until_entry_applied(&log_entry, entry_index, MAX_TICKS);
             assert_eq!(result, true);
             cluster.stop();
         }
+
+        /// This test
+        #[test]
+        fn log_conflict() {}
     }
 }
 
