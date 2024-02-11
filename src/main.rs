@@ -1669,7 +1669,7 @@ mod tests {
             assert_eq!(cluster.has_leader(), true);
         }
 
-        /// This test checks the functionality of a request vote request for a single node cluster
+        /// This test checks the functionality of a node receiving a vote request
         #[test]
         fn request_vote_success() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -1700,12 +1700,13 @@ mod tests {
                 VoteResponse {
                     term: 1,
                     vote_granted: true,
-                    candidate_id: 1
+                    candidate_id: 0
                 }
             );
         }
 
-        /// This test should fail because a node receives a vote request where the log is behind its own log
+        /// This test checks whether a node refuses to grant a vote because its own log
+        /// is ahead of the candidates log
         #[test]
         fn request_vote_fail_log_check() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -1716,7 +1717,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(1, cluster_config);
 
-            let node = cluster.get_by_id_mut(1);
+            let node = cluster.get_by_id_mut(0);
             let mut node_state = node.state.lock().unwrap();
             node_state.current_term = 2;
             node_state.log.push(LogEntry {
@@ -1753,7 +1754,7 @@ mod tests {
                 VoteResponse {
                     term: 2,
                     vote_granted: false,
-                    candidate_id: 1
+                    candidate_id: 0
                 }
             );
         }
@@ -1769,7 +1770,7 @@ mod tests {
             let mut cluster = TestCluster::new(1, cluster_config);
 
             {
-                let node = cluster.get_by_id_mut(1);
+                let node = cluster.get_by_id_mut(0);
                 let mut node_state = node.state.lock().unwrap();
                 node_state.current_term = 1;
                 node_state.voted_for = Some(1);
@@ -1787,7 +1788,7 @@ mod tests {
                     key: "a".to_string(),
                     value: 1,
                 }],
-                leader_commit_index: 1,
+                leader_commit_index: 0,
             };
             let message = RPCMessage::AppendEntriesRequest(request);
 
@@ -1801,13 +1802,13 @@ mod tests {
                 AppendEntriesResponse {
                     term: 1,
                     success: true,
-                    server_id: 1,
+                    server_id: 0,
                     match_index: 1
                 }
             );
 
             {
-                let node = cluster.get_by_id_mut(1);
+                let node = cluster.get_by_id_mut(0);
                 let node_state = node.state.lock().unwrap();
                 assert_eq!(node_state.log.len(), 1);
             }
