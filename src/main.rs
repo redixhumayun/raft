@@ -10,11 +10,13 @@ use std::io::{self, BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufReader};
 use types::RaftTypeTrait;
+use warp::filters::ws::Message;
 
 use log::{error, info};
 use rand::Rng;
@@ -32,6 +34,10 @@ use storage::{DirectFileOpsWriter, RaftFileOps};
  */
 
 trait Communication<T: RaftTypeTrait> {
+    fn start(&self);
+
+    fn stop(&self);
+
     fn send_message(
         &self,
         from_server_id: ServerId,
@@ -41,7 +47,8 @@ trait Communication<T: RaftTypeTrait> {
     );
 }
 
-struct MockMessage<T: RaftTypeTrait> {
+#[derive(Debug, Clone)]
+struct MessageWrapper<T: RaftTypeTrait> {
     from_node_id: ServerId,
     to_node_id: ServerId,
     message: RPCMessage<T>,
@@ -49,19 +56,21 @@ struct MockMessage<T: RaftTypeTrait> {
 
 struct MockRPCManager<T: RaftTypeTrait> {
     server_id: ServerId,
-    to_node_sender: mpsc::Sender<RPCMessage<T>>,
-    sent_messages: RefCell<Vec<MockMessage<T>>>,
+    to_node_sender: mpsc::Sender<MessageWrapper<T>>,
+    sent_messages: RefCell<Vec<MessageWrapper<T>>>,
 }
 
 impl<T: RaftTypeTrait> MockRPCManager<T> {
-    fn new(server_id: ServerId, to_node_sender: mpsc::Sender<RPCMessage<T>>) -> Self {
+    fn new(server_id: ServerId, to_node_sender: mpsc::Sender<MessageWrapper<T>>) -> Self {
         MockRPCManager {
             server_id,
             to_node_sender,
             sent_messages: RefCell::new(vec![]),
         }
     }
+}
 
+impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
     fn start(&self) {
         info!("Starting the mock rpc manager");
     }
@@ -69,9 +78,7 @@ impl<T: RaftTypeTrait> MockRPCManager<T> {
     fn stop(&self) {
         info!("Stopping the mock rpc manager");
     }
-}
 
-impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
     fn send_message(
         &self,
         from_server_id: ServerId,
@@ -79,12 +86,22 @@ impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
         _to_address: String,
         message: RPCMessage<T>,
     ) {
-        let mock_message = MockMessage {
+        let mock_message = MessageWrapper {
             from_node_id: from_server_id,
             to_node_id: to_server_id,
             message,
         };
         self.sent_messages.borrow_mut().push(mock_message);
+    }
+}
+
+impl<T: RaftTypeTrait> MockRPCManager<T> {
+    fn get_messages_in_queue(&mut self) -> Vec<MessageWrapper<T>> {
+        let mut mock_messages_vector: Vec<MessageWrapper<T>> = Vec::new();
+        for message in self.sent_messages.borrow_mut().drain(..) {
+            mock_messages_vector.push(message.clone());
+        }
+        mock_messages_vector
     }
 }
 
@@ -181,6 +198,73 @@ impl<T: RaftTypeTrait> RPCManager<T> {
 }
 
 impl<T: RaftTypeTrait> Communication<T> for RPCManager<T> {
+    fn start(&self) {
+        let server_address = self.server_address.clone();
+        let server_id = self.server_id.clone();
+        let to_node_sender = self.to_node_sender.clone();
+        let is_running = self.is_running.clone();
+        is_running.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(&server_address) {
+                Ok(tcp_listener) => tcp_listener,
+                Err(e) => {
+                    panic!(
+                        "There was an error while binding to the address {} for server id {} {}",
+                        server_address, server_id, e
+                    );
+                }
+            };
+
+            for stream in listener.incoming() {
+                if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => {
+                        let reader = BufReader::new(stream);
+                        for line in reader.lines() {
+                            let json = match line {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    panic!("There was an error while reading the line {}", e);
+                                }
+                            };
+                            let rpc: RPCMessage<T> = match serde_json::from_str(&json) {
+                                Ok(message) => message,
+                                Err(e) => {
+                                    panic!(
+                                        "There was an error while deserializing the message {}",
+                                        e
+                                    );
+                                }
+                            };
+                            match to_node_sender.send(rpc) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    panic!(
+                                        "There was an error while sending the rpc message to the node {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        error!("There was an error while accepting a connection {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    fn stop(&self) {
+        self.is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /**
      * This method is called from the raft node to allow it to communicate with other nodes
      * via the RPC manager.
@@ -221,6 +305,57 @@ impl<T: RaftTypeTrait> Communication<T> for RPCManager<T> {
         if let Err(e) = stream.write_all(serialized_request.as_bytes()) {
             error!("There was an error while sending the message {}", e);
             panic!("There was an error while sending the message {}", e);
+        }
+    }
+}
+
+enum CommunicationLayer<T: RaftTypeTrait> {
+    MockRPCManager(MockRPCManager<T>),
+    RPCManager(RPCManager<T>),
+}
+
+impl<T: RaftTypeTrait> Communication<T> for CommunicationLayer<T> {
+    fn start(&self) {
+        match self {
+            CommunicationLayer::MockRPCManager(manager) => manager.start(),
+            CommunicationLayer::RPCManager(manager) => manager.start(),
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            CommunicationLayer::MockRPCManager(manager) => manager.stop(),
+            CommunicationLayer::RPCManager(manager) => manager.stop(),
+        }
+    }
+
+    fn send_message(
+        &self,
+        from_server_id: ServerId,
+        to_server_id: ServerId,
+        to_address: String,
+        message: RPCMessage<T>,
+    ) {
+        match self {
+            CommunicationLayer::MockRPCManager(manager) => {
+                manager.send_message(from_server_id, to_server_id, to_address, message)
+            }
+            CommunicationLayer::RPCManager(manager) => {
+                manager.send_message(from_server_id, to_server_id, to_address, message)
+            }
+        }
+    }
+}
+
+impl<T: RaftTypeTrait> CommunicationLayer<T> {
+    fn get_messages(&mut self) -> Vec<MessageWrapper<T>> {
+        match self {
+            CommunicationLayer::MockRPCManager(manager) => {
+                return manager.get_messages_in_queue();
+            }
+            CommunicationLayer::RPCManager(_) => {
+                panic!("This method is not supported for the RPCManager");
+            }
         }
     }
 }
@@ -296,10 +431,10 @@ struct AppendEntriesResponse {
     success: bool,
     match_index: u64,
 }
-
 /**
  * End RPC stuff
  */
+
 #[derive(Debug)]
 struct ServerConfig {
     election_timeout: Duration, //  used to calculate the actual election timeout
@@ -416,9 +551,9 @@ struct RaftNode<T: RaftTypeTrait, S: StateMachine<T>, F: RaftFileOps<T>> {
     state_machine: S,
     config: ServerConfig,
     peers: Vec<ServerId>,
-    to_node_sender: mpsc::Sender<RPCMessage<T>>,
-    from_rpc_receiver: mpsc::Receiver<RPCMessage<T>>,
-    rpc_manager: RPCManager<T>,
+    to_node_sender: mpsc::Sender<MessageWrapper<T>>,
+    from_rpc_receiver: mpsc::Receiver<MessageWrapper<T>>,
+    rpc_manager: CommunicationLayer<T>,
     persistence_manager: F,
     clock: RaftNodeClock,
 }
@@ -984,9 +1119,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.log = log_entries;
     }
 
-    fn message_update_term_if_required(&mut self, message: RPCMessage<T>) {
+    fn message_update_term_if_required(&mut self, message_wrapper: MessageWrapper<T>) {
         let mut state_guard = self.state.lock().unwrap();
-        match message {
+        match message_wrapper.message {
             RPCMessage::VoteRequest(message) => {
                 if message.term > state_guard.current_term {
                     self.update_term(&mut state_guard, message.term);
@@ -1010,9 +1145,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
     }
 
-    fn is_message_stale(&self, message: RPCMessage<T>) -> bool {
+    fn is_message_stale(&self, message_wrapper: MessageWrapper<T>) -> bool {
         let state_guard = self.state.lock().unwrap();
-        match message {
+        match message_wrapper.message {
             RPCMessage::VoteRequest(message) => message.term < state_guard.current_term,
             RPCMessage::VoteResponse(message) => message.term < state_guard.current_term,
             RPCMessage::AppendEntriesRequest(message) => message.term < state_guard.current_term,
@@ -1037,9 +1172,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
           /\ \/ DropStaleResponse(i, j, m)
              \/ HandleAppendEntriesResponse(i, j, m)
      */
-    fn receive(&mut self, message: RPCMessage<T>) -> Option<(RPCMessage<T>, ServerId)> {
-        self.message_update_term_if_required(message.clone());
-        return match message {
+    fn receive(&mut self, message_wrapper: MessageWrapper<T>) -> Option<(RPCMessage<T>, ServerId)> {
+        self.message_update_term_if_required(message_wrapper.clone());
+        return match message_wrapper.message {
             RPCMessage::VoteRequest(request) => {
                 let response = self.handle_vote_request(&request);
                 Some((RPCMessage::VoteResponse(response), request.candidate_id))
@@ -1281,6 +1416,9 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         config: ServerConfig,
         peers: Vec<ServerId>,
         persistence_manager: F,
+        rpc_manager: CommunicationLayer<T>,
+        to_node_sender: Sender<MessageWrapper<T>>,
+        from_rpc_receiver: Receiver<MessageWrapper<T>>,
         clock: RaftNodeClock,
     ) -> Self {
         let election_jitter = rand::thread_rng().gen_range(0..100);
@@ -1298,13 +1436,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             match_index: Vec::new(),
             last_heartbeat: Instant::now(),
         };
-        let (to_node_sender, from_rpc_receiver) = mpsc::channel();
-        let rpc_manager = RPCManager::new(
-            id,
-            config.address.clone(),
-            config.port,
-            to_node_sender.clone(),
-        );
         let server = RaftNode {
             id,
             state: Mutex::new(server_state),
@@ -1355,7 +1486,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         let mut state_guard = self.state.lock().unwrap();
         self.rpc_manager.stop();
         let address = &self.config.address;
-        let _ = TcpStream::connect(address);
+        let _ = TcpStream::connect(address); //  doing this so that the listener actually closes (H/T to Phil Eaton https://github.com/eatonphil/raft-rs/blob/main/src/lib.rs#L1921)
 
         state_guard.current_term = 0;
         state_guard.commit_index = 0;
@@ -1387,36 +1518,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 }
 
-fn main() {
-    let persistence_manager = match DirectFileOpsWriter::new("temp", 0) {
-        Ok(pm) => pm,
-        Err(e) => {
-            panic!(
-                "There was an error while creating the persistence manager {}",
-                e
-            );
-        }
-    };
-    let state_machine = KeyValueStore::<String>::new();
-    let server_config = ServerConfig {
-        election_timeout: Duration::from_millis(150),
-        heartbeat_interval: Duration::from_millis(50),
-        address: "127.0.0.1:8080".to_string(),
-        port: 0,
-        cluster_nodes: vec![1, 2, 3],
-        id_to_address_mapping: HashMap::new(),
-    };
-    let clock = RaftNodeClock::RealClock(RealClock {});
-    let mut server = RaftNode::new(
-        0,
-        state_machine,
-        server_config,
-        vec![1, 2, 3],
-        persistence_manager,
-        clock,
-    );
-    server.start();
-}
+fn main() {}
 
 //  An example state machine - a key value store
 struct KeyValueStore<T> {
@@ -1461,13 +1563,31 @@ mod tests {
 
         pub struct TestCluster {
             pub nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
+            pub message_queue: Vec<MessageWrapper<i32>>,
             pub _config: ClusterConfig,
         }
 
         impl TestCluster {
             pub fn tick(&mut self) {
+                //  Collect all messages from nodes and store them in the central queue
+                self.nodes.iter_mut().for_each(|node| {
+                    let mut messages_from_node = node.rpc_manager.get_messages();
+                    self.message_queue.append(&mut messages_from_node);
+                });
+
+                //  allow each node to tick
                 self.nodes.iter_mut().for_each(|node| {
                     node.tick();
+                });
+
+                //  deliver all messages from the central queue
+                self.message_queue.drain(..).into_iter().map(|message| {
+                    let node = self
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == message.to_node_id)
+                        .unwrap();
+                    node.to_node_sender.send(message);
                 });
                 // since i am not mocking the network layer in tests, i need this for now to
                 // simulate actual passage of time so that the TCP layer can actually deliver the
@@ -1477,7 +1597,6 @@ mod tests {
 
             pub fn tick_by(&mut self, tick_interval: u64) {
                 for _ in 0..tick_interval {
-                    //  call the tick method for the cluster here
                     self.tick();
                 }
             }
@@ -1491,7 +1610,7 @@ mod tests {
 
             pub fn send_message_to_all_nodes(
                 &mut self,
-                message: RPCMessage<i32>,
+                message: MessageWrapper<i32>,
             ) -> Vec<Option<(RPCMessage<i32>, ServerId)>> {
                 //  send this message to every node
                 let mut responses: Vec<Option<(RPCMessage<i32>, ServerId)>> = Vec::new();
@@ -1611,6 +1730,12 @@ mod tests {
 
                     let state_machine = KeyValueStore::<i32>::new();
                     let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
+                    let (to_node_sender, from_rpc_receiver) =
+                        mpsc::channel::<MessageWrapper<i32>>();
+                    let rpc_manager = CommunicationLayer::MockRPCManager(MockRPCManager::new(
+                        *node_id,
+                        to_node_sender.clone(),
+                    ));
                     let mock_clock = RaftNodeClock::MockClock(MockClock {
                         current_time: Instant::now(),
                     });
@@ -1621,13 +1746,19 @@ mod tests {
                         server_config,
                         node_ids.clone(),
                         persistence_manager,
+                        rpc_manager,
+                        to_node_sender,
+                        from_rpc_receiver,
                         mock_clock,
                     );
                     nodes.push(node);
                     counter += 1;
                 }
+                let message_queue = Vec::new();
+
                 TestCluster {
                     nodes,
+                    message_queue,
                     _config: config,
                 }
             }
@@ -1690,8 +1821,13 @@ mod tests {
                 last_log_term: 0,
             };
             let message = RPCMessage::VoteRequest(request);
+            let message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message,
+            };
 
-            let response = cluster.send_message_to_all_nodes(message);
+            let response = cluster.send_message_to_all_nodes(message_wrapper);
 
             let vote_response = match response.get(0).unwrap() {
                 Some((RPCMessage::VoteResponse(response), _)) => response,
@@ -1746,8 +1882,13 @@ mod tests {
                 last_log_term: 1,
             };
             let message = RPCMessage::VoteRequest(request);
+            let message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message,
+            };
 
-            let response = cluster.send_message_to_all_nodes(message);
+            let response = cluster.send_message_to_all_nodes(message_wrapper);
             let vote_response = match response.get(0).unwrap() {
                 Some((RPCMessage::VoteResponse(response), _)) => response,
                 _ => panic!("The response is not a vote response"),
@@ -1794,8 +1935,13 @@ mod tests {
                 leader_commit_index: 0,
             };
             let message = RPCMessage::AppendEntriesRequest(request);
+            let message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message,
+            };
 
-            let response = cluster.send_message_to_all_nodes(message);
+            let response = cluster.send_message_to_all_nodes(message_wrapper);
             let append_response = match response.get(0).unwrap() {
                 Some((RPCMessage::AppendEntriesResponse(response), _)) => response,
                 _ => panic!("The response is not an append entries response"),
@@ -1834,7 +1980,13 @@ mod tests {
                 last_log_term: 0,
             };
             let vote_message: RPCMessage<i32> = RPCMessage::VoteRequest(vote_request);
-            cluster.send_message_to_all_nodes(vote_message);
+            let vote_message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message: vote_message,
+            };
+
+            cluster.send_message_to_all_nodes(vote_message_wrapper);
 
             let request = AppendEntriesRequest {
                 term: 1,
@@ -1851,7 +2003,13 @@ mod tests {
                 leader_commit_index: 0,
             };
             let message = RPCMessage::AppendEntriesRequest(request);
-            cluster.send_message_to_all_nodes(message);
+            let message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message,
+            };
+
+            cluster.send_message_to_all_nodes(message_wrapper);
 
             let node = cluster.get_by_id_mut(0);
             node.stop();
@@ -2003,82 +2161,5 @@ mod tests {
         /// This test
         #[test]
         fn log_conflict() {}
-    }
-}
-
-/**
- * All these nodes assume a single node in the cluster
- */
-
-#[cfg(test)]
-mod cluster_tests {
-
-    use super::*;
-
-    /**
-     * Use this method to create a test cluster of nodes
-     */
-    type TestCluster = Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>;
-    fn create_test_cluster(number_of_nodes: u64, starting_port: u64) -> TestCluster {
-        let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = Vec::new();
-        let node_ids: Vec<ServerId> = (1..=number_of_nodes).collect();
-        let ports: Vec<u64> = (starting_port..starting_port + number_of_nodes).collect();
-        let addresses: Vec<String> = ports
-            .iter()
-            .map(|port| format!("127.0.0.1:{}", port))
-            .collect();
-        let mut id_to_address_mapping: HashMap<ServerId, String> = HashMap::new();
-        for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
-            id_to_address_mapping.insert(*node_id, address.clone());
-        }
-
-        let mut counter = 0;
-        for (node_id, address) in node_ids.iter().zip(addresses.iter()) {
-            let server_config = ServerConfig {
-                election_timeout: Duration::from_millis(150),
-                heartbeat_interval: Duration::from_millis(50),
-                address: address.clone(),
-                port: ports[counter],
-                cluster_nodes: node_ids.clone(),
-                id_to_address_mapping: id_to_address_mapping.clone(),
-            };
-
-            let state_machine = KeyValueStore::<i32>::new();
-            let persistence_manager = DirectFileOpsWriter::new("data", *node_id).unwrap();
-            let mock_clock = RaftNodeClock::MockClock(MockClock {
-                current_time: Instant::now(),
-            });
-
-            let node = RaftNode::new(
-                *node_id,
-                state_machine,
-                server_config,
-                node_ids.clone(),
-                persistence_manager,
-                mock_clock,
-            );
-            nodes.push(node);
-            counter += 1;
-        }
-        nodes
-    }
-
-    fn advance_cluster_by(cluster: &mut TestCluster, advance_by: Duration) {
-        for node in cluster {
-            node.clock.advance(advance_by);
-        }
-    }
-
-    fn cluster_tick(cluster: &mut TestCluster) {
-        for node in cluster {
-            node.tick();
-        }
-    }
-
-    #[test]
-    fn test_leader_election() {
-        let mut cluster = create_test_cluster(3, 8000);
-        advance_cluster_by(&mut cluster, Duration::from_millis(250));
-        cluster_tick(&mut cluster);
     }
 }
