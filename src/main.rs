@@ -4,7 +4,7 @@ use clock::{Clock, MockClock, RealClock};
 use core::fmt;
 use serde::de::DeserializeOwned;
 use serde_json;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::cmp::min;
 use std::io::{self, BufRead, Write};
 use std::net::{TcpListener, TcpStream};
@@ -70,7 +70,7 @@ impl<T: RaftTypeTrait> MockRPCManager<T> {
     }
 }
 
-impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
+impl<T: RaftTypeTrait> MockRPCManager<T> {
     fn start(&self) {
         info!("Starting the mock rpc manager");
     }
@@ -93,15 +93,17 @@ impl<T: RaftTypeTrait> Communication<T> for MockRPCManager<T> {
         };
         self.sent_messages.borrow_mut().push(mock_message);
     }
-}
 
-impl<T: RaftTypeTrait> MockRPCManager<T> {
     fn get_messages_in_queue(&mut self) -> Vec<MessageWrapper<T>> {
         let mut mock_messages_vector: Vec<MessageWrapper<T>> = Vec::new();
         for message in self.sent_messages.borrow_mut().drain(..) {
             mock_messages_vector.push(message.clone());
         }
         mock_messages_vector
+    }
+
+    fn replay_messages_in_queue(&self) -> Ref<Vec<MessageWrapper<T>>> {
+        self.sent_messages.borrow()
     }
 }
 
@@ -129,75 +131,6 @@ impl<T: RaftTypeTrait> RPCManager<T> {
         }
     }
 
-    fn start(&self) {
-        let server_address = self.server_address.clone();
-        let server_id = self.server_id.clone();
-        let to_node_sender = self.to_node_sender.clone();
-        let is_running = self.is_running.clone();
-        is_running.store(true, std::sync::atomic::Ordering::SeqCst);
-        thread::spawn(move || {
-            let listener = match TcpListener::bind(&server_address) {
-                Ok(tcp_listener) => tcp_listener,
-                Err(e) => {
-                    panic!(
-                        "There was an error while binding to the address {} for server id {} {}",
-                        server_address, server_id, e
-                    );
-                }
-            };
-
-            for stream in listener.incoming() {
-                if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                match stream {
-                    Ok(stream) => {
-                        let reader = BufReader::new(stream);
-                        for line in reader.lines() {
-                            let json = match line {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    panic!("There was an error while reading the line {}", e);
-                                }
-                            };
-                            let rpc: RPCMessage<T> = match serde_json::from_str(&json) {
-                                Ok(message) => message,
-                                Err(e) => {
-                                    panic!(
-                                        "There was an error while deserializing the message {}",
-                                        e
-                                    );
-                                }
-                            };
-                            match to_node_sender.send(rpc) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    panic!(
-                                        "There was an error while sending the rpc message to the node {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if !is_running.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
-                        error!("There was an error while accepting a connection {}", e);
-                    }
-                }
-            }
-        });
-    }
-
-    fn stop(&self) {
-        self.is_running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl<T: RaftTypeTrait> Communication<T> for RPCManager<T> {
     fn start(&self) {
         let server_address = self.server_address.clone();
         let server_id = self.server_id.clone();
@@ -352,6 +285,17 @@ impl<T: RaftTypeTrait> CommunicationLayer<T> {
         match self {
             CommunicationLayer::MockRPCManager(manager) => {
                 return manager.get_messages_in_queue();
+            }
+            CommunicationLayer::RPCManager(_) => {
+                panic!("This method is not supported for the RPCManager");
+            }
+        }
+    }
+
+    fn replay_messages(&self) -> Ref<Vec<MessageWrapper<T>>> {
+        match self {
+            CommunicationLayer::MockRPCManager(manager) => {
+                return manager.replay_messages_in_queue();
             }
             CommunicationLayer::RPCManager(_) => {
                 panic!("This method is not supported for the RPCManager");
@@ -1581,18 +1525,29 @@ mod tests {
                 });
 
                 //  deliver all messages from the central queue
-                self.message_queue.drain(..).into_iter().map(|message| {
-                    let node = self
-                        .nodes
-                        .iter()
-                        .find(|node| node.id == message.to_node_id)
-                        .unwrap();
-                    node.to_node_sender.send(message);
-                });
+                self.message_queue
+                    .drain(..)
+                    .into_iter()
+                    .for_each(|message| {
+                        let node = self
+                            .nodes
+                            .iter()
+                            .find(|node| node.id == message.to_node_id)
+                            .unwrap();
+                        match node.to_node_sender.send(message) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                panic!(
+                                    "There was an error while sending the message to the node: {}",
+                                    e
+                                )
+                            }
+                        };
+                    });
                 // since i am not mocking the network layer in tests, i need this for now to
                 // simulate actual passage of time so that the TCP layer can actually deliver the
                 // message
-                thread::sleep(Duration::from_millis(10));
+                // thread::sleep(Duration::from_millis(10));
             }
 
             pub fn tick_by(&mut self, tick_interval: u64) {
@@ -1608,6 +1563,20 @@ mod tests {
                 }
             }
 
+            pub fn transmit_message_to_all_nodes(&mut self, message: MessageWrapper<i32>) {
+                for node in &mut self.nodes {
+                    match node.to_node_sender.send(message.clone()) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            panic!(
+                                "There was an error while sending the message to the node: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             pub fn send_message_to_all_nodes(
                 &mut self,
                 message: MessageWrapper<i32>,
@@ -1619,6 +1588,13 @@ mod tests {
                     responses.push(response);
                 }
                 return responses;
+            }
+
+            pub fn get_by_id(
+                &self,
+                id: ServerId,
+            ) -> &RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter> {
+                self.nodes.iter().find(|node| node.id == id).unwrap()
             }
 
             pub fn get_by_id_mut(
@@ -1827,6 +1803,25 @@ mod tests {
                 message,
             };
 
+            // cluster.transmit_message_to_all_nodes(message_wrapper);
+            // cluster.tick_by(1);
+            // let node = cluster.get_by_id(0);
+            // let messages_on_node = node.rpc_manager.replay_messages();
+            // assert_eq!(messages_on_node.len(), 1);
+            // let message_on_node = messages_on_node.get(0).unwrap().message.clone();
+            // let vote_response = match message_on_node {
+            //     RPCMessage::VoteResponse(response) => response,
+            //     _ => panic!("The response is not a vote response"),
+            // };
+            // assert_eq!(
+            //     vote_response,
+            //     VoteResponse {
+            //         term: 1,
+            //         vote_granted: true,
+            //         candidate_id: 0,
+            //     },
+            // );
+
             let response = cluster.send_message_to_all_nodes(message_wrapper);
 
             let vote_response = match response.get(0).unwrap() {
@@ -2015,8 +2010,12 @@ mod tests {
             node.stop();
             node.restart();
             let log_length = node.state.lock().unwrap().log.len();
+            let term = node.state.lock().unwrap().current_term;
+            let voted_for = node.state.lock().unwrap().voted_for.clone();
             cluster.stop();
             assert_eq!(log_length, 1);
+            assert_eq!(term, 1);
+            assert_eq!(voted_for, Some(1));
         }
 
         /// This test will determine whether a leader correctly advances its commit index
