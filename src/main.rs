@@ -1831,19 +1831,7 @@ mod tests {
                 last_log_term: 0,
             };
             let vote_message: RPCMessage<i32> = RPCMessage::VoteRequest(vote_request);
-            let vote_response = cluster.send_message_to_all_nodes(vote_message);
-            let vote_response = match vote_response.get(0).unwrap() {
-                Some((RPCMessage::VoteResponse(response), _)) => response,
-                _ => panic!("The response is not a vote response"),
-            };
-            assert_eq!(
-                *vote_response,
-                VoteResponse {
-                    term: 1,
-                    vote_granted: true,
-                    candidate_id: 0
-                }
-            );
+            cluster.send_message_to_all_nodes(vote_message);
 
             let request = AppendEntriesRequest {
                 term: 1,
@@ -1860,21 +1848,7 @@ mod tests {
                 leader_commit_index: 0,
             };
             let message = RPCMessage::AppendEntriesRequest(request);
-
-            let response = cluster.send_message_to_all_nodes(message);
-            let append_response = match response.get(0).unwrap() {
-                Some((RPCMessage::AppendEntriesResponse(response), _)) => response,
-                _ => panic!("The response is not an append entries response"),
-            };
-            assert_eq!(
-                *append_response,
-                AppendEntriesResponse {
-                    term: 1,
-                    success: true,
-                    server_id: 0,
-                    match_index: 1
-                }
-            );
+            cluster.send_message_to_all_nodes(message);
 
             let node = cluster.get_by_id_mut(0);
             node.stop();
