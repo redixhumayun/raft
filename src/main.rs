@@ -1841,7 +1841,7 @@ mod tests {
                 VoteResponse {
                     term: 1,
                     vote_granted: true,
-                    candidate_id: 1
+                    candidate_id: 0
                 }
             );
 
@@ -1857,7 +1857,7 @@ mod tests {
                     key: "a".to_string(),
                     value: 1,
                 }],
-                leader_commit_index: 1,
+                leader_commit_index: 0,
             };
             let message = RPCMessage::AppendEntriesRequest(request);
 
@@ -1871,12 +1871,12 @@ mod tests {
                 AppendEntriesResponse {
                     term: 1,
                     success: true,
-                    server_id: 1,
+                    server_id: 0,
                     match_index: 1
                 }
             );
 
-            let node = cluster.get_by_id_mut(1);
+            let node = cluster.get_by_id_mut(0);
             node.stop();
             node.restart();
             let node_state = node.state.lock().unwrap();
