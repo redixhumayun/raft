@@ -38,13 +38,7 @@ trait Communication<T: RaftTypeTrait> {
 
     fn stop(&self);
 
-    fn send_message(
-        &self,
-        from_server_id: ServerId,
-        to_server_id: ServerId,
-        to_address: String,
-        message: RPCMessage<T>,
-    );
+    fn send_message(&self, to_address: String, message: MessageWrapper<T>);
 }
 
 #[derive(Debug, Clone)]
@@ -72,26 +66,15 @@ impl<T: RaftTypeTrait> MockRPCManager<T> {
 
 impl<T: RaftTypeTrait> MockRPCManager<T> {
     fn start(&self) {
-        info!("Starting the mock rpc manager");
+        info!("Starting the mock rpc manager for node {}", self.server_id);
     }
 
     fn stop(&self) {
-        info!("Stopping the mock rpc manager");
+        info!("Stopping the mock rpc manager for node {}", self.server_id);
     }
 
-    fn send_message(
-        &self,
-        from_server_id: ServerId,
-        to_server_id: ServerId,
-        _to_address: String,
-        message: RPCMessage<T>,
-    ) {
-        let mock_message = MessageWrapper {
-            from_node_id: from_server_id,
-            to_node_id: to_server_id,
-            message,
-        };
-        self.sent_messages.borrow_mut().push(mock_message);
+    fn send_message(&self, _to_address: String, message: MessageWrapper<T>) {
+        self.sent_messages.borrow_mut().push(message);
     }
 
     fn get_messages_in_queue(&mut self) -> Vec<MessageWrapper<T>> {
@@ -202,41 +185,29 @@ impl<T: RaftTypeTrait> RPCManager<T> {
      * This method is called from the raft node to allow it to communicate with other nodes
      * via the RPC manager.
      */
-    fn send_message(
-        &self,
-        from_server_id: ServerId,
-        to_server_id: ServerId,
-        to_address: String,
-        message: RPCMessage<T>,
-    ) {
+    fn send_message(&self, to_address: String, message: MessageWrapper<T>) {
         info!(
             "Sending a message from server {} to server {} and the message is {:?}",
-            from_server_id, to_server_id, message
+            message.from_node_id, message.to_node_id, message.message
         );
         let mut stream = match TcpStream::connect(to_address) {
             Ok(stream) => stream,
             Err(e) => {
-                error!(
-                    "There was an error while connecting to the server {} {}",
-                    to_server_id, e
-                );
                 panic!(
                     "There was an error while connecting to the server {} {}",
-                    to_server_id, e
+                    message.to_node_id, e
                 );
             }
         };
 
-        let serialized_request = match serde_json::to_string(&message) {
+        let serialized_request = match serde_json::to_string(&message.message) {
             Ok(serialized_message) => serialized_message,
             Err(e) => {
-                error!("There was an error while serializing the message {}", e);
                 panic!("There was an error while serializing the message {}", e);
             }
         };
 
         if let Err(e) = stream.write_all(serialized_request.as_bytes()) {
-            error!("There was an error while sending the message {}", e);
             panic!("There was an error while sending the message {}", e);
         }
     }
@@ -262,20 +233,12 @@ impl<T: RaftTypeTrait> Communication<T> for CommunicationLayer<T> {
         }
     }
 
-    fn send_message(
-        &self,
-        from_server_id: ServerId,
-        to_server_id: ServerId,
-        to_address: String,
-        message: RPCMessage<T>,
-    ) {
+    fn send_message(&self, to_address: String, message: MessageWrapper<T>) {
         match self {
             CommunicationLayer::MockRPCManager(manager) => {
-                manager.send_message(from_server_id, to_server_id, to_address, message)
+                manager.send_message(to_address, message)
             }
-            CommunicationLayer::RPCManager(manager) => {
-                manager.send_message(from_server_id, to_server_id, to_address, message)
-            }
+            CommunicationLayer::RPCManager(manager) => manager.send_message(to_address, message),
         }
     }
 }
@@ -952,8 +915,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             .id_to_address_mapping
             .get(&to_server_id)
             .unwrap();
+        let message_wrapper = MessageWrapper {
+            from_node_id: self.id,
+            to_node_id: to_server_id,
+            message,
+        };
         self.rpc_manager
-            .send_message(self.id, to_server_id, to_address.clone(), message);
+            .send_message(to_address.clone(), message_wrapper);
     }
 
     /**
@@ -1193,8 +1161,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             let to_address = self.config.id_to_address_mapping.get(&peer).expect(
                 format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
             );
+            let message_wrapper = MessageWrapper {
+                from_node_id: self.id,
+                to_node_id: *peer,
+                message,
+            };
             self.rpc_manager
-                .send_message(self.id, *peer, to_address.clone(), message);
+                .send_message(to_address.clone(), message_wrapper);
         }
     }
 
@@ -1217,13 +1190,17 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 entries: Vec::<LogEntry<T>>::new(),
                 leader_commit_index: state_guard.commit_index,
             };
+            let message = RPCMessage::<T>::AppendEntriesRequest(heartbeat_request);
             let to_address = self.config.id_to_address_mapping.get(peer).expect(
                 format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
             );
-            let message = RPCMessage::<T>::AppendEntriesRequest(heartbeat_request);
-
+            let message_wrapper = MessageWrapper {
+                from_node_id: self.id,
+                to_node_id: *peer,
+                message,
+            };
             self.rpc_manager
-                .send_message(self.id, *peer, to_address.clone(), message);
+                .send_message(to_address.clone(), message_wrapper);
         }
     }
 
@@ -1233,22 +1210,15 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn check_election_timeout(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
         if (self.clock.now() - state_guard.last_heartbeat) >= state_guard.election_timeout {
-            info!("Node {} has timed out", self.id);
             match state_guard.status {
                 RaftNodeStatus::Leader => {
                     //  do nothing
-                    info!("Node {} is still the leader", self.id);
                 }
                 RaftNodeStatus::Candidate => {
-                    info!(
-                        "Node {} was a candidate. Giving up on the election",
-                        self.id
-                    );
                     state_guard.status = RaftNodeStatus::Follower;
                     self.reset_election_timeout(state_guard);
                 }
                 RaftNodeStatus::Follower => {
-                    info!("Node {} was a follower. Starting an election", self.id);
                     self.reset_election_timeout(state_guard);
                     self.start_election(state_guard);
                 }
@@ -1314,8 +1284,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             let to_address = self.config.id_to_address_mapping.get(peer).expect(
                 format!("Cannot find the id to address mapping for peer id {}", peer).as_str(),
             );
+            let message_wrapper = MessageWrapper {
+                from_node_id: self.id,
+                to_node_id: *peer,
+                message,
+            };
             self.rpc_manager
-                .send_message(self.id, *peer, to_address.clone(), message);
+                .send_message(to_address.clone(), message_wrapper);
         }
         Ok(index)
     }
@@ -1411,12 +1386,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                     )
                     .as_str(),
                 );
-                self.rpc_manager.send_message(
-                    self.id,
-                    from_id,
-                    to_address.to_owned(),
-                    message_response,
-                );
+                let message_wrapper = MessageWrapper {
+                    from_node_id: self.id,
+                    to_node_id: from_id,
+                    message: message_response,
+                };
+                self.rpc_manager
+                    .send_message(to_address.clone(), message_wrapper);
             }
         }
     }
@@ -1803,25 +1779,6 @@ mod tests {
                 message,
             };
 
-            // cluster.transmit_message_to_all_nodes(message_wrapper);
-            // cluster.tick_by(1);
-            // let node = cluster.get_by_id(0);
-            // let messages_on_node = node.rpc_manager.replay_messages();
-            // assert_eq!(messages_on_node.len(), 1);
-            // let message_on_node = messages_on_node.get(0).unwrap().message.clone();
-            // let vote_response = match message_on_node {
-            //     RPCMessage::VoteResponse(response) => response,
-            //     _ => panic!("The response is not a vote response"),
-            // };
-            // assert_eq!(
-            //     vote_response,
-            //     VoteResponse {
-            //         term: 1,
-            //         vote_granted: true,
-            //         candidate_id: 0,
-            //     },
-            // );
-
             let response = cluster.send_message_to_all_nodes(message_wrapper);
 
             let vote_response = match response.get(0).unwrap() {
@@ -1839,7 +1796,7 @@ mod tests {
             );
         }
 
-        /// This test checks whether a node refuses to grant a vote because its own log
+        /// This test asserts that a node refuses to grant a vote because its own log
         /// is ahead of the candidates log
         #[test]
         fn request_vote_fail_log_check() {
