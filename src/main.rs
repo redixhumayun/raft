@@ -16,9 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufReader};
 use types::RaftTypeTrait;
-use warp::filters::ws::Message;
 
-use log::{error, info};
+use log::{debug, error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -65,13 +64,9 @@ impl<T: RaftTypeTrait> MockRPCManager<T> {
 }
 
 impl<T: RaftTypeTrait> MockRPCManager<T> {
-    fn start(&self) {
-        info!("Starting the mock rpc manager for node {}", self.server_id);
-    }
+    fn start(&self) {}
 
-    fn stop(&self) {
-        info!("Stopping the mock rpc manager for node {}", self.server_id);
-    }
+    fn stop(&self) {}
 
     fn send_message(&self, _to_address: String, message: MessageWrapper<T>) {
         self.sent_messages.borrow_mut().push(message);
@@ -616,19 +611,17 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         request: &AppendEntriesRequest<T>,
     ) -> AppendEntriesResponse {
         let mut state_guard = self.state.lock().unwrap();
-        info!(
-            "Received an append entries request from server {} and the request is {:?}",
-            request.leader_id, request
-        );
+        debug!("ENTER: handle_append_entries_request for node {}", self.id);
 
         //  the term check
         if request.term < state_guard.current_term && state_guard.status == RaftNodeStatus::Follower
         {
+            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
-                match_index: request.prev_log_index,
+                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
             };
         }
 
@@ -644,11 +637,12 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         //  the log check is not OK, give false response
         if !log_ok {
+            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
-                match_index: request.prev_log_index,
+                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
             };
         }
 
@@ -663,14 +657,15 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.commit_index = request.leader_commit_index;
         self.apply_entries(&mut state_guard);
 
-        //  heartbeat check - register the heartbeat time
+        self.reset_election_timeout(&mut state_guard);
         if request.entries.len() == 0 {
-            self.reset_election_timeout(&mut state_guard);
+            //  this is a  heartbeat message
+            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
-                match_index: request.prev_log_index, // no new logs have been committed
+                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
             };
         }
 
@@ -701,12 +696,12 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         if duplicates {
-            info!("All the entries passed in are duplicates. Not appending anything but updating the match index sent back to the leadaer");
+            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
-                match_index: self.len_as_u64(&state_guard.log) - 1,
+                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
             };
         }
 
@@ -773,18 +768,18 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                     self.len_as_u64(&state_guard.log),
                 );
             }
+            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
-                match_index: request.prev_log_index + self.len_as_u64(&request.entries), //  the last known log to be committed
+                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
             };
         }
 
         //  There are no subsequent logs on the follower, so no possibility of conflicts. Which means the logs can just be appended
         //  and the response can be returned
         state_guard.log.append(&mut request.entries.clone());
-        info!("Writing the log entries to file");
         if let Err(e) = self.persistence_manager.append_logs(&request.entries) {
             error!(
                 "There was a problem appending logs to stable storage for node {}: {}",
@@ -792,17 +787,17 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             );
         }
 
-        return AppendEntriesResponse {
+        debug!("EXIT: handle_append_entries_request for node {}", self.id);
+        AppendEntriesResponse {
             server_id: self.id,
             term: state_guard.current_term,
             success: true,
-            match_index: request.prev_log_index + self.len_as_u64(&request.entries), //  TODO: Fix this
-        };
+            match_index: state_guard.log.last().map_or(0, |entry| entry.index),
+        }
     }
 
     fn handle_append_entries_response(&mut self, response: AppendEntriesResponse) {
         let mut state_guard = self.state.lock().unwrap();
-        info!("Handling the response");
         if state_guard.status != RaftNodeStatus::Leader {
             return;
         }
@@ -820,15 +815,18 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         //  the response is successful
-        info!(
+        debug!(
             "The response was successful, updating next index and match index for server {} and the response is {:?}",
             response.server_id, response
         );
         state_guard.next_index[(response.server_id) as usize] = response.match_index + 1;
         state_guard.match_index[(response.server_id) as usize] = response.match_index;
+        debug!(
+            "The new set of next indices and match indices are: {:?} and {:?}",
+            state_guard.next_index, state_guard.match_index
+        );
         self.advance_commit_index(&mut state_guard);
         self.apply_entries(&mut state_guard);
-        return;
     }
 
     //  Utility functions for main RPC's
@@ -951,6 +949,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
            /\ UNCHANGED <<messages, serverVars, candidateVars, leaderVars, log>>
         */
     fn advance_commit_index(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        debug!("ENTER: advance_commit_index for node {}", self.id);
         assert!(state_guard.status == RaftNodeStatus::Leader);
 
         //  find all match indexes that have quorum
@@ -958,6 +957,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         for &server_match_index in &state_guard.match_index {
             *match_index_count.entry(server_match_index).or_insert(0) += 1;
         }
+        debug!("The match index count: {:?}", match_index_count);
 
         let new_commit_index = match_index_count
             .iter()
@@ -971,15 +971,27 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             .map(|(&match_index, _)| match_index)
             .max();
 
+        debug!(
+            "The old commit index was: {} and the new commit index is: {}",
+            state_guard.commit_index,
+            new_commit_index.unwrap_or(state_guard.commit_index)
+        );
         if let Some(max_index) = new_commit_index {
             state_guard.commit_index = max_index;
         }
+        debug!("EXIT: advance_commit_index for node {}", self.id);
     }
 
     /// This function will check whether there are any more entries that can be applied to the state machine for the node
     fn apply_entries(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
+        debug!("ENTER: apply_entries for node {}", self.id);
         let mut entries_to_apply: Vec<LogEntry<T>> = Vec::new();
+        debug!(
+            "last_applied: {}, commit_index: {}",
+            state_guard.last_applied, state_guard.commit_index
+        );
         while state_guard.last_applied < state_guard.commit_index {
+            debug!("Updating the state machine for node {}", self.id);
             state_guard.last_applied += 1;
             let entry_at_index = state_guard
                 .log
@@ -988,7 +1000,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             entries_to_apply.push(entry_at_index.clone());
         }
 
-        self.state_machine.apply(entries_to_apply);
+        if entries_to_apply.len() > 0 {
+            self.state_machine.apply(entries_to_apply);
+        }
+        debug!("EXIT: apply_entries for node {}", self.id);
     }
 
     /**
@@ -1112,16 +1127,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn can_become_leader(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) -> bool {
-        info!("Checking if node {} can become leader", self.id);
         let sum_of_votes_received = state_guard
             .votes_received
             .iter()
             .filter(|(_, vote_granted)| **vote_granted)
             .count();
         let quorum = self.quorum_size();
-        let result = sum_of_votes_received >= quorum;
-        info!("Node {} can become leader: {}", self.id, result);
-        return result;
+        sum_of_votes_received >= quorum
     }
 
     /// This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
@@ -1250,6 +1262,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             return Err("This node is not the leader".to_string());
         }
         let mut state_guard = self.state.lock().unwrap();
+        info!(
+            "Setting the key: {}, value: {} pair on node {}",
+            key, value, self.id
+        );
         let log_entry = LogEntry {
             term: state_guard.current_term,
             index: state_guard.log.last().map_or(1, |entry| entry.index + 1),
@@ -1270,6 +1286,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 e
             ));
         }
+        //  update the match index of the leader
+        //  This isn't strictly required but it makes subsequent calculations to advance the
+        //  commit_index easier
+        state_guard.match_index[self.id as usize] += 1;
         for peer in &self.peers {
             if *peer == self.id {
                 continue;
@@ -1461,10 +1481,11 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
     }
 
     fn apply_get(&self, key: &str) -> Option<T> {
-        return self.store.borrow().get(key).cloned();
+        self.store.borrow().get(key).cloned()
     }
 
     fn apply(&self, entries: Vec<LogEntry<T>>) {
+        debug!("Applying the following entries: {:?}", entries);
         for entry in entries {
             self.store.borrow_mut().insert(entry.key, entry.value);
         }
@@ -1476,6 +1497,7 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
 mod tests {
     use super::*;
     mod common {
+
         use super::*;
         pub struct ClusterConfig {
             pub election_timeout: Duration,
@@ -1532,6 +1554,15 @@ mod tests {
                 for _ in 0..tick_interval {
                     self.tick();
                 }
+            }
+
+            pub fn advance_time_by_for_node(&mut self, node_id: ServerId, duration: Duration) {
+                let node = self
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == node_id)
+                    .expect(&format!("Could not find node with id: {}", node_id));
+                node.advance_time_by(duration);
             }
 
             pub fn advance_time_by(&mut self, duration: Duration) {
@@ -1601,7 +1632,21 @@ mod tests {
             pub fn drop_node(&mut self, id: ServerId) -> bool {
                 let old_length = self.nodes.len();
                 self.nodes.retain(|node| node.id != id);
-                return self.nodes.len() != old_length;
+                self.nodes.len() != old_length
+            }
+
+            pub fn send_client_request(
+                &mut self,
+                key: String,
+                value: i32,
+                command: LogEntryCommand,
+            ) -> usize {
+                if command == LogEntryCommand::Set {
+                    let leader = self.get_leader_mut().expect("Could not find leader");
+                    leader.set_key_value_pair(key, value).unwrap()
+                } else {
+                    0
+                }
             }
 
             pub fn wait_for_stable_leader(&mut self, max_ticks: u64) -> bool {
@@ -1631,12 +1676,14 @@ mod tests {
                         let state_guard = node.state.lock().unwrap();
                         state_guard.log.get(expected_index) == Some(&log_entry)
                     });
-                    // let key = &log_entry.key;
-                    // let is_applied = self
-                    //     .nodes
-                    //     .iter()
-                    //     .all(|node| node.state_machine.apply_get(key).is_some());
-                    if is_in_log {
+                    let key = &log_entry.key;
+                    let is_applied = self.nodes.iter().all(|node| {
+                        let r = node.state_machine.apply_get(key).is_some();
+                        r
+                    });
+                    debug!("is_in_log: {}, is_applied: {}", is_in_log, is_applied);
+                    if is_in_log && is_applied {
+                        info!("Took {} ticks to apply the entry across the cluster", ticks);
                         return true;
                     }
                     self.tick();
@@ -2164,20 +2211,12 @@ mod tests {
             let node = cluster.get_by_id_mut(0);
             node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
             cluster.wait_for_stable_leader(MAX_TICKS);
-            assert_eq!(cluster.has_leader(), true);
             let (leader_id, leader_term) = {
                 let leader = cluster.get_leader().unwrap();
                 let leader_term = leader.state.lock().unwrap().current_term;
                 (leader.id, leader_term)
             };
-            let mut ticks = 0;
-            loop {
-                if ticks >= MAX_TICKS {
-                    break;
-                }
-                cluster.tick();
-                ticks += 1;
-            }
+            cluster.tick_by(MAX_TICKS);
             let new_leader = cluster.get_leader().unwrap();
             let new_leader_term = new_leader.state.lock().unwrap().current_term;
             cluster.stop();
@@ -2197,8 +2236,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(2, cluster_config);
             cluster.start();
-            let node = cluster.get_by_id_mut(0);
-            node.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
+            cluster.advance_time_by(ELECTION_TIMEOUT);
             cluster.wait_for_stable_leader(MAX_TICKS);
             let (log_entry, entry_index) = {
                 let leader = cluster.get_leader_mut().unwrap();
@@ -2218,6 +2256,91 @@ mod tests {
             let result = cluster.wait_until_entry_applied(&log_entry, entry_index, MAX_TICKS);
             assert_eq!(result, true);
             cluster.stop();
+        }
+    }
+
+    mod three_node_cluster {
+        use super::common::*;
+        use super::*;
+
+        const ELECTION_TIMEOUT: Duration = Duration::from_millis(150);
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+        const MAX_TICKS: u64 = 100;
+
+        /// Assert that in a 3-node cluster one of the nodes eventually becomes leader within a certain number of ticks
+        #[test]
+        fn leader_election() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+            cluster.advance_time_by(ELECTION_TIMEOUT);
+            cluster.start();
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            cluster.stop();
+            assert_eq!(cluster.has_leader(), true);
+        }
+
+        /// This test will determine whether an elected leader sends heartbeats regularly during its term
+        /// It does so by checking that the leader and term haven't changed after the iterations are done
+        /// This indicates that a leader regularly sent heartbeats which prevented an election timeout
+        #[test]
+        fn leader_send_heartbeats() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+            cluster.start();
+            cluster.advance_time_by(ELECTION_TIMEOUT);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            let (current_leader_id, current_leader_term) = {
+                let leader = cluster.get_leader().unwrap();
+                let term = leader.state.lock().unwrap().current_term;
+                (leader.id, term)
+            };
+            cluster.tick_by(MAX_TICKS);
+            let new_leader = cluster.get_leader().unwrap();
+            let new_leader_term = new_leader.state.lock().unwrap().current_term;
+            assert_eq!(current_leader_id, new_leader.id);
+            assert_eq!(current_leader_term, new_leader_term);
+        }
+
+        #[test]
+        fn apply_entries() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+            cluster.start();
+            cluster.advance_time_by(ELECTION_TIMEOUT);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            let log_index = cluster.send_client_request("a".to_string(), 1, LogEntryCommand::Set);
+            let expected_log_entry = LogEntry {
+                term: cluster
+                    .get_leader()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .current_term,
+                index: (log_index + 1) as u64, //  log indices in raft are 1-based
+                command: LogEntryCommand::Set,
+                key: "a".to_string(),
+                value: 1,
+            };
+            let apply_entry_result =
+                cluster.wait_until_entry_applied(&expected_log_entry, log_index, MAX_TICKS);
+            cluster.stop();
+            assert_eq!(apply_entry_result, true);
         }
     }
 }
