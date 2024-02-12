@@ -713,11 +713,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  Now, we know the prefix is ok. First, check that there are no subsequent logs on the follower.
         //  If there are subequent logs, and there is a conflict, discard logs from the conflict point onwards
         if self.len_as_u64(&state_guard.log) > log_index {
+            info!("Checking the suffix of the logs on the follower");
             let max_range = min(
                 self.len_as_u64(&state_guard.log) - log_index,
                 self.len_as_u64(&request.entries),
             );
             let mut conflict_point = -1;
+            let mut new_entries_conflict_point = -1;
 
             //  Check if a conflict point exists. Also check if all the logs are already replicated on this follower
             for index in 0..max_range {
@@ -729,32 +731,32 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                         log_index - 1 + index
                     ));
 
-                let message_entry = request
-                    .entries
-                    .get((log_index - 1 + index) as usize)
-                    .expect(&format!(
-                        "There is no entry at index {} in the request entries array",
-                        log_index - 1 + index
-                    ));
+                let message_entry = request.entries.get((index) as usize).expect(&format!(
+                    "There is no entry at index {} in the request entries array",
+                    index
+                ));
 
                 if follower_entry.term != message_entry.term {
                     conflict_point = (log_index - 1 + index) as i64;
+                    new_entries_conflict_point = index as i64;
                     break;
                 }
             }
 
             if conflict_point != -1 {
                 info!(
-                    "Conflict point detected, truncating logs for node {}",
-                    self.id
+                    "Conflict point detected at {}, truncating logs for node {}",
+                    conflict_point, self.id
                 );
+                info!("Log before truncating: {:?}", state_guard.log);
                 state_guard.log.truncate(conflict_point as usize);
+                info!("Log after truncating: {:?}", state_guard.log);
             } else {
                 conflict_point = self.len_as_u64(&state_guard.log) as i64;
             }
 
             //  Now, start appending logs from the conflict point onwards
-            let entries_to_insert = &request.entries[(conflict_point as usize)..];
+            let entries_to_insert = &request.entries[(new_entries_conflict_point as usize)..];
             state_guard.log.extend_from_slice(entries_to_insert);
             if let Err(e) = self
                 .persistence_manager
@@ -2013,6 +2015,110 @@ mod tests {
                 assert_eq!(state_guard.commit_index, 2);
             }
         }
+
+        /// This test asserts that a node that receives a set of log entries that is in conflict with its own log entries, then it will find the conflict
+        /// point and truncate all log entries from that point onwards before writing the new log entries
+        #[test]
+        fn log_conflict() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000],
+            };
+            let entries_on_node = vec![
+                LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                },
+                LogEntry {
+                    term: 1,
+                    index: 2,
+                    command: LogEntryCommand::Set,
+                    key: "b".to_string(),
+                    value: 1,
+                },
+                LogEntry {
+                    term: 1,
+                    index: 3,
+                    command: LogEntryCommand::Set,
+                    key: "c".to_string(),
+                    value: 2,
+                },
+            ];
+            let mut cluster = TestCluster::new(1, cluster_config);
+            {
+                let node = cluster.get_by_id_mut(0);
+                node.state.lock().unwrap().log = entries_on_node;
+            }
+
+            let new_entries_sent_to_node = vec![
+                LogEntry {
+                    term: 2,
+                    index: 2,
+                    command: LogEntryCommand::Set,
+                    key: "d".to_string(),
+                    value: 1,
+                },
+                LogEntry {
+                    term: 2,
+                    index: 3,
+                    command: LogEntryCommand::Set,
+                    key: "d".to_string(),
+                    value: 2,
+                },
+            ];
+            let request = AppendEntriesRequest {
+                term: 2,
+                leader_id: 1,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: new_entries_sent_to_node,
+                leader_commit_index: 1,
+            };
+            let message = RPCMessage::AppendEntriesRequest(request);
+            let message_wrapper = MessageWrapper {
+                from_node_id: 1,
+                to_node_id: 0,
+                message,
+            };
+            cluster.send_message_to_all_nodes(message_wrapper);
+
+            //  check that the log of the node is correct here now
+            let resolved_log = vec![
+                LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: LogEntryCommand::Set,
+                    key: "a".to_string(),
+                    value: 1,
+                },
+                LogEntry {
+                    term: 2,
+                    index: 2,
+                    command: LogEntryCommand::Set,
+                    key: "d".to_string(),
+                    value: 1,
+                },
+                LogEntry {
+                    term: 2,
+                    index: 3,
+                    command: LogEntryCommand::Set,
+                    key: "d".to_string(),
+                    value: 2,
+                },
+            ];
+            {
+                let node = cluster.get_by_id(0);
+                let log = &node.state.lock().unwrap().log;
+                info!("Log entries: {:?}", log);
+                assert_eq!(log.len(), 3);
+                assert_eq!(*log, resolved_log);
+            }
+        }
     }
 
     mod two_node_cluster {
@@ -2113,9 +2219,5 @@ mod tests {
             assert_eq!(result, true);
             cluster.stop();
         }
-
-        /// This test
-        #[test]
-        fn log_conflict() {}
     }
 }
