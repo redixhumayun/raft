@@ -499,6 +499,14 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
+        if state_guard.status == RaftNodeStatus::Candidate {
+            return VoteResponse {
+                term: state_guard.current_term,
+                vote_granted: false,
+                candidate_id: self.id,
+            };
+        }
+
         //  basic term check first - if the request term is lower ignore the request
         if request.term < state_guard.current_term {
             return VoteResponse {
@@ -614,8 +622,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         debug!("ENTER: handle_append_entries_request for node {}", self.id);
 
         //  the term check
-        if request.term < state_guard.current_term && state_guard.status == RaftNodeStatus::Follower
-        {
+        if request.term < state_guard.current_term {
             debug!("The term in the request is less than the current term, ignoring the request");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
@@ -626,20 +633,34 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        // the log check
-        let prev_log_term_for_this_node = state_guard
+        if request.term > state_guard.current_term
+            || state_guard.status == RaftNodeStatus::Candidate
+        {
+            debug!(
+                "Node {} was a candidate but is resetting to a follower",
+                self.id
+            );
+            state_guard.status = RaftNodeStatus::Follower;
+            state_guard.current_term = request.term;
+            self.reset_election_timeout(&mut state_guard);
+        }
+        self.reset_election_timeout(&mut state_guard);
+
+        // log consistency check
+        let prev_log_index = request.prev_log_index.saturating_sub(1) as usize;
+        let prev_log_term = state_guard
             .log
-            .get((request.prev_log_index.saturating_sub(1)) as usize) //  subtracting 1 from prev_log_index as log index is 1 based but .get() is 0 based
+            .get(prev_log_index)
             .map_or(0, |entry| entry.term);
         let log_ok = request.prev_log_index == 0
             || (request.prev_log_index > 0
                 && request.prev_log_index <= state_guard.log.len() as u64
-                && request.prev_log_term == prev_log_term_for_this_node);
+                && request.prev_log_term == prev_log_term);
 
         //  the log check is not OK, give false response
         if !log_ok {
             debug!("The node's log is {:?}", state_guard.log);
-            debug!("The log check failed because request has prev_log_index as {} and prev_log_term as {} and the node has prev_log_index as {} and prev_log_term as {}", request.prev_log_index, request.prev_log_term, state_guard.log.len(), prev_log_term_for_this_node);
+            debug!("The log check failed because request has prev_log_index as {} and prev_log_term as {} and the node has prev_log_index as {} and prev_log_term as {}", request.prev_log_index, request.prev_log_term, state_guard.log.len(), prev_log_term);
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -649,18 +670,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        //  the candidate check - revert to follower if true
-        if request.term == state_guard.current_term
-            && state_guard.status == RaftNodeStatus::Candidate
-        {
-            state_guard.status = RaftNodeStatus::Follower;
-        }
-
         //  update the commit index on this node and apply all pending entries
         state_guard.commit_index = request.leader_commit_index;
         self.apply_entries(&mut state_guard);
 
-        self.reset_election_timeout(&mut state_guard);
         if request.entries.len() == 0 {
             //  this is a  heartbeat message
             debug!("This is a heartbeat message, returning success");
