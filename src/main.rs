@@ -26,7 +26,7 @@ mod storage;
 mod types;
 
 use crate::types::{ServerId, Term};
-use storage::{DirectFileOpsWriter, RaftFileOps};
+use storage::RaftFileOps;
 
 /**
  * RPC Stuff
@@ -1499,6 +1499,7 @@ mod tests {
     mod common {
 
         use super::*;
+        use storage::DirectFileOpsWriter;
         pub struct ClusterConfig {
             pub election_timeout: Duration,
             pub heartbeat_interval: Duration,
