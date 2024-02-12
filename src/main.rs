@@ -2330,6 +2330,8 @@ mod tests {
             assert_eq!(current_leader_term, new_leader_term);
         }
 
+        /// This test will check whether a key value pair submitted by a client is appended to the logs of the nodes in the cluster
+        /// and replicated across the state machines of the cluster
         #[test]
         fn apply_entries() {
             let _ = env_logger::builder().is_test(true).try_init();
