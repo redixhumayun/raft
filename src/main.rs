@@ -616,6 +616,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  the term check
         if request.term < state_guard.current_term && state_guard.status == RaftNodeStatus::Follower
         {
+            debug!("The term in the request is less than the current term, ignoring the request");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -628,7 +629,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         // the log check
         let prev_log_term_for_this_node = state_guard
             .log
-            .get(request.prev_log_index as usize)
+            .get((request.prev_log_index.saturating_sub(1)) as usize) //  subtracting 1 from prev_log_index as log index is 1 based but .get() is 0 based
             .map_or(0, |entry| entry.term);
         let log_ok = request.prev_log_index == 0
             || (request.prev_log_index > 0
@@ -637,6 +638,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         //  the log check is not OK, give false response
         if !log_ok {
+            debug!("The node's log is {:?}", state_guard.log);
+            debug!("The log check failed because request has prev_log_index as {} and prev_log_term as {} and the node has prev_log_index as {} and prev_log_term as {}", request.prev_log_index, request.prev_log_term, state_guard.log.len(), prev_log_term_for_this_node);
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -660,6 +663,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         self.reset_election_timeout(&mut state_guard);
         if request.entries.len() == 0 {
             //  this is a  heartbeat message
+            debug!("This is a heartbeat message, returning success");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -696,6 +700,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         }
 
         if duplicates {
+            debug!("The logs are already present, returning success");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 server_id: self.id,
@@ -708,7 +713,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  Now, we know the prefix is ok. First, check that there are no subsequent logs on the follower.
         //  If there are subequent logs, and there is a conflict, discard logs from the conflict point onwards
         if self.len_as_u64(&state_guard.log) > log_index {
-            info!("Checking the suffix of the logs on the follower");
+            debug!("Checking the suffix of the logs on the follower");
             let max_range = min(
                 self.len_as_u64(&state_guard.log) - log_index,
                 self.len_as_u64(&request.entries),
@@ -739,13 +744,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             }
 
             if conflict_point != -1 {
-                info!(
+                debug!(
                     "Conflict point detected at {}, truncating logs for node {}",
                     conflict_point, self.id
                 );
-                info!("Log before truncating: {:?}", state_guard.log);
+                debug!("Log before truncating: {:?}", state_guard.log);
                 state_guard.log.truncate(conflict_point as usize);
-                info!("Log after truncating: {:?}", state_guard.log);
+                debug!("Log after truncating: {:?}", state_guard.log);
             } else {
                 conflict_point = self.len_as_u64(&state_guard.log) as i64;
             }
