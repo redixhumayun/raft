@@ -808,7 +808,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 .saturating_sub(1)
                 .max(1);
 
-            self.retry_append_request(&state_guard, server_index, response.server_id);
+            self.retry_append_request(&mut state_guard, server_index, response.server_id);
             return;
         }
 
@@ -860,24 +860,34 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
     fn retry_append_request(
         &self,
-        state_guard: &MutexGuard<'_, RaftNodeState<T>>,
+        state_guard: &mut MutexGuard<'_, RaftNodeState<T>>,
         server_index: usize,
         to_server_id: u64,
     ) {
-        let next_log_index = state_guard.next_index[server_index] as usize;
-        let entries_to_send: Vec<LogEntry<T>> = if next_log_index < state_guard.log.len() {
-            state_guard.log[(next_log_index - 1) as usize..].to_vec()
-        } else {
-            vec![]
-        };
+        let next_index_of_follower = state_guard.next_index[server_index] as usize;
+        let new_next_index_of_follower = next_index_of_follower.saturating_sub(1).max(1);
+        state_guard.next_index[server_index] = new_next_index_of_follower as u64;
 
-        let prev_log_index = if next_log_index > 1 {
-            (next_log_index - 1) as u64
+        let entries_to_send = state_guard
+            .log
+            .get(new_next_index_of_follower - 1..)
+            .unwrap()
+            .to_vec();
+        let prev_log_index = if new_next_index_of_follower > 1 {
+            state_guard
+                .log
+                .get(new_next_index_of_follower - 1)
+                .unwrap()
+                .index
         } else {
             0
         };
-        let prev_log_term = if next_log_index > 1 {
-            state_guard.log[next_log_index - 1].term
+        let prev_log_term = if new_next_index_of_follower > 1 {
+            state_guard
+                .log
+                .get(new_next_index_of_follower - 1)
+                .unwrap()
+                .term
         } else {
             0
         };
@@ -1684,7 +1694,7 @@ mod tests {
                     self.tick();
                     ticks += 1;
                 }
-                return false;
+                false
             }
 
             pub fn wait_until_entry_applied(
