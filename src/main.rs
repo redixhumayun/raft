@@ -1455,6 +1455,8 @@ mod tests {
     use super::*;
     mod common {
 
+        use std::{borrow::Borrow, collections::HashSet};
+
         use super::*;
         use storage::DirectFileOpsWriter;
         pub struct ClusterConfig {
@@ -1466,7 +1468,8 @@ mod tests {
         pub struct TestCluster {
             pub nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
             pub message_queue: Vec<MessageWrapper<i32>>,
-            pub _config: ClusterConfig,
+            pub connectivity: HashMap<ServerId, HashSet<ServerId>>,
+            pub config: ClusterConfig,
         }
 
         impl TestCluster {
@@ -1492,15 +1495,23 @@ mod tests {
                             .iter()
                             .find(|node| node.id == message.to_node_id)
                             .unwrap();
-                        match node.to_node_sender.send(message) {
-                            Ok(_) => (),
-                            Err(e) => {
-                                panic!(
-                                    "There was an error while sending the message to the node: {}",
-                                    e
-                                )
-                            }
-                        };
+                        //  check if these pair of nodes are partitioned
+                        if self
+                            .connectivity
+                            .get_mut(&message.from_node_id)
+                            .unwrap()
+                            .contains(&message.to_node_id)
+                        {
+                            match node.to_node_sender.send(message) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    panic!(
+                                        "There was an error while sending the message to the node: {}",
+                                        e
+                                    )
+                                }
+                            };
+                        }
                     });
                 // since i am not mocking the network layer in tests, i need this for now to
                 // simulate actual passage of time so that the TCP layer can actually deliver the
@@ -1584,6 +1595,25 @@ mod tests {
                 self.nodes.iter().filter(|node| node.is_leader()).count() == 1
             }
 
+            /// This function will check that the partitioned cluster the node_id is a part of has a leader
+            pub fn has_leader_in_partition(&self, node_id: ServerId) -> bool {
+                let node_ids_in_cluster = self.connectivity.borrow().get(&node_id).unwrap();
+                let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = self
+                    .nodes
+                    .iter()
+                    .filter(|node| node_ids_in_cluster.contains(&node.id))
+                    .collect();
+                debug!("Node ids: {:?}", node_ids_in_cluster);
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        debug!("node {} is leader {}", node.id, node.is_leader());
+                        return node.is_leader();
+                    })
+                    .count()
+                    == 1
+            }
+
             pub fn get_leader(
                 &self,
             ) -> Option<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
@@ -1603,6 +1633,12 @@ mod tests {
                     .iter_mut()
                     .filter(|node| !node.is_leader())
                     .last()
+            }
+
+            pub fn get_all_followers(
+                &self,
+            ) -> Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes.iter().filter(|node| !node.is_leader()).collect()
             }
 
             pub fn drop_node(&mut self, id: ServerId) -> bool {
@@ -1689,6 +1725,35 @@ mod tests {
                 false
             }
 
+            /// Separates the cluster into two smaller clusters where only the nodes within
+            /// each cluster can communicate between themselves
+            pub fn partition(&mut self, group1: &[ServerId], group2: &[ServerId]) {
+                for &node_id in group1 {
+                    self.connectivity
+                        .get_mut(&node_id)
+                        .unwrap()
+                        .retain(|&id| group1.contains(&id));
+                }
+                for &node_id in group2 {
+                    self.connectivity
+                        .get_mut(&node_id)
+                        .unwrap()
+                        .retain(|&id| group2.contains(&id));
+                }
+            }
+
+            /// Removes any partition in the cluster and restores full connectivity among all nodes
+            pub fn heal_partition(&mut self) {
+                let all_node_ids = self
+                    .nodes
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<HashSet<ServerId>>();
+                for node_id in all_node_ids.iter() {
+                    self.connectivity.insert(*node_id, all_node_ids.clone());
+                }
+            }
+
             pub fn query_state_machine_across_nodes<'a>(
                 &'a self,
                 keys: Vec<&'a str>,
@@ -1754,10 +1819,16 @@ mod tests {
                 }
                 let message_queue = Vec::new();
 
+                let mut connectivity_hm: HashMap<ServerId, HashSet<ServerId>> = HashMap::new();
+                for node_id in &node_ids {
+                    connectivity_hm.insert(*node_id, node_ids.clone().into_iter().collect());
+                }
+
                 TestCluster {
                     nodes,
                     message_queue,
-                    _config: config,
+                    connectivity: connectivity_hm,
+                    config,
                 }
             }
 
@@ -2350,6 +2421,9 @@ mod tests {
         /// The situation in which this could potentially come up is when there are three nodes - A, B & C. C is the leader and receives a client request
         /// and appends it to its own log but then crashes before it can replicate it. A becomes the leader and C comes back online. However, C now has an
         /// additional log entry that is not present on the leader
+
+        /// This test models the scenario where a follower has a log entry that is out of sync with the leader. When the leader sends a heartbeat, it will
+        /// recognize this and attempt to fix the incorrect log entry by rewinding the log back to a point where there is no conflict
         #[test]
         fn retry_failed_append_entry_request() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -2420,6 +2494,35 @@ mod tests {
             let result = cluster.verify_logs_across_cluster(&expected_log_entries, MAX_TICKS);
             cluster.stop();
             assert_eq!(result, true);
+        }
+
+        /// This test models the scenario where the leader in a cluster is network partitioned from the
+        /// rest of the cluster and a new leader is elected
+        #[test]
+        fn network_partition_new_leader() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+            cluster.start();
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+
+            //  partition the leader from the rest of the group
+            debug!("PARTITION HERE");
+            let group1 = &[cluster.get_leader().unwrap().id];
+            let group2 = &cluster
+                .get_all_followers()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<ServerId>>();
+            cluster.partition(group1, group2);
+            cluster.tick_by(MAX_TICKS);
+            cluster.has_leader_in_partition(1);
+            // assert_eq!(cluster.has_leader(), true);
         }
     }
 }
