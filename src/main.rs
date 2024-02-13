@@ -490,25 +490,11 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
          */
     fn handle_vote_request(&mut self, request: &VoteRequest) -> VoteResponse {
         let mut state_guard = self.state.lock().unwrap();
-
-        if state_guard.status == RaftNodeStatus::Leader {
-            return VoteResponse {
-                term: state_guard.current_term,
-                vote_granted: false,
-                candidate_id: self.id,
-            };
-        }
-
-        if state_guard.status == RaftNodeStatus::Candidate {
-            return VoteResponse {
-                term: state_guard.current_term,
-                vote_granted: false,
-                candidate_id: self.id,
-            };
-        }
+        debug!("ENTER: handle_vote_request on node {}", self.id);
 
         //  basic term check first - if the request term is lower ignore the request
         if request.term < state_guard.current_term {
+            debug!("EXIT: handle_vote_request on node {}. Not granting the vote because request term is lower", self.id);
             return VoteResponse {
                 term: state_guard.current_term,
                 vote_granted: false,
@@ -518,6 +504,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         //  this node has already voted for someone else in this term and it is not the requesting node
         if state_guard.voted_for != None && state_guard.voted_for != Some(request.candidate_id) {
+            debug!("EXIT: handle_vote_request on node {}. Not granting the vote because the node has already voted for someone else", self.id);
             return VoteResponse {
                 term: state_guard.current_term,
                 vote_granted: false,
@@ -550,6 +537,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 error!("There was a problem writing the term and voted_for variables to stable storage for node {}: {}", self.id, e);
             }
         }
+        debug!(
+            "EXIT: handle_vote_request on node {}. Granting the vote for {}",
+            self.id, request.candidate_id
+        );
         VoteResponse {
             term: state_guard.current_term,
             vote_granted: true,
@@ -633,17 +624,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        if request.term > state_guard.current_term
-            || state_guard.status == RaftNodeStatus::Candidate
-        {
-            debug!(
-                "Node {} was a candidate but is resetting to a follower",
-                self.id
-            );
-            state_guard.status = RaftNodeStatus::Follower;
-            state_guard.current_term = request.term;
-            self.reset_election_timeout(&mut state_guard);
-        }
         self.reset_election_timeout(&mut state_guard);
 
         // log consistency check
@@ -878,23 +858,6 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.match_index = vec![0; self.config.cluster_nodes.len()];
     }
 
-    fn update_term(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>, new_term: Term) {
-        state_guard.current_term = new_term;
-        state_guard.voted_for = None;
-        state_guard.status = RaftNodeStatus::Follower;
-
-        if let Err(e) = self
-            .persistence_manager
-            .write_term_and_voted_for(new_term, None)
-        {
-            //  valid to panic here because this is a write to disk
-            panic!(
-                "There was an error while writing the term and voted for to stable storage {}",
-                e
-            );
-        }
-    }
-
     fn retry_append_request(
         &self,
         state_guard: &MutexGuard<'_, RaftNodeState<T>>,
@@ -1066,7 +1029,28 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         state_guard.log = log_entries;
     }
 
-    fn message_update_term_if_required(&mut self, message_wrapper: MessageWrapper<T>) {
+    /// Any RPC with a  newer term should force the node to advance its own term, reset to a Follower and set its voted_for to None
+    /// before continuing to process the message
+    fn update_term(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>, new_term: Term) {
+        debug!("ENTER: update_term for node {}", self.id);
+        state_guard.current_term = new_term;
+        state_guard.voted_for = None;
+        state_guard.status = RaftNodeStatus::Follower;
+
+        if let Err(e) = self
+            .persistence_manager
+            .write_term_and_voted_for(new_term, None)
+        {
+            //  valid to panic here because this is a write to disk
+            panic!(
+                "There was an error while writing the term and voted for to stable storage {}",
+                e
+            );
+        }
+        debug!("EXIT: update_term for node {}", self.id);
+    }
+
+    fn update_node_term_if_required(&mut self, message_wrapper: MessageWrapper<T>) {
         let mut state_guard = self.state.lock().unwrap();
         match message_wrapper.message {
             RPCMessage::VoteRequest(message) => {
@@ -1120,13 +1104,17 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
              \/ HandleAppendEntriesResponse(i, j, m)
      */
     fn receive(&mut self, message_wrapper: MessageWrapper<T>) -> Option<(RPCMessage<T>, ServerId)> {
-        self.message_update_term_if_required(message_wrapper.clone());
-        return match message_wrapper.message {
+        self.update_node_term_if_required(message_wrapper.clone());
+        let message_wrapper_clone = message_wrapper.clone();
+        match message_wrapper.message {
             RPCMessage::VoteRequest(request) => {
                 let response = self.handle_vote_request(&request);
                 Some((RPCMessage::VoteResponse(response), request.candidate_id))
             }
             RPCMessage::VoteResponse(response) => {
+                if self.is_message_stale(message_wrapper_clone.clone()) {
+                    return None;
+                }
                 self.handle_vote_response(response);
                 None
             }
@@ -1138,10 +1126,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 ))
             }
             RPCMessage::AppendEntriesResponse(response) => {
+                if self.is_message_stale(message_wrapper_clone.clone()) {
+                    return None;
+                }
                 self.handle_append_entries_response(response);
                 None
             }
-        };
+        }
     }
 
     fn can_become_leader(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) -> bool {
@@ -1157,7 +1148,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     /// This method will cause a node to elevate itself to candidate, cast a vote for itself, write that
     /// vote to storage and then send out messages to all other peers requesting votes
     fn start_election(&self, state_guard: &mut MutexGuard<'_, RaftNodeState<T>>) {
-        info!("Node {} is starting an election", self.id);
+        debug!("ENTER: start_election for node {}", self.id);
         state_guard.status = RaftNodeStatus::Candidate;
         state_guard.current_term += 1;
         state_guard.voted_for = Some(self.id);
@@ -1175,6 +1166,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  Check to ensure that a single node system will be immediately elected a leader. Feels a bit hacky
         if self.can_become_leader(state_guard) {
             self.become_leader(state_guard);
+            debug!(
+                "EXIT: start_election and node {} has become the leader",
+                self.id
+            );
             return;
         }
 
@@ -1201,6 +1196,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             self.rpc_manager
                 .send_message(to_address.clone(), message_wrapper);
         }
+        debug!("EXIT: start_election for node {}", self.id);
     }
 
     fn send_heartbeat(&self, state_guard: &MutexGuard<'_, RaftNodeState<T>>) {
@@ -1411,14 +1407,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
     }
 
     fn listen_for_messages(&mut self) {
-        if let Ok(message) = self.from_rpc_receiver.try_recv() {
-            info!("Received a message on node {}: {:?}", self.id, message);
-            if self.is_message_stale(message.clone()) {
-                //  dropping a stale message
-                return;
-            }
-
-            if let Some((message_response, from_id)) = self.receive(message.clone()) {
+        if let Ok(message_wrapper) = self.from_rpc_receiver.try_recv() {
+            // info!("Received a message on node {}: {:?}", self.id, message);
+            info!(
+                "Received message on node {} from node {} {:?}",
+                self.id, message_wrapper.from_node_id, message_wrapper.message
+            );
+            if let Some((message_response, from_id)) = self.receive(message_wrapper.clone()) {
                 let to_address = self.config.id_to_address_mapping.get(&from_id).expect(
                     format!(
                         "Cannot find the id to address mapping for peer id {}",
@@ -1582,6 +1577,15 @@ mod tests {
                     .find(|node| node.id == node_id)
                     .expect(&format!("Could not find node with id: {}", node_id));
                 node.advance_time_by(duration);
+            }
+
+            pub fn advance_time_by_variably(&mut self, duration: Duration) {
+                //  for each node in the cluster, advance it's mock clock by the duration + some random variation
+                for node in &mut self.nodes {
+                    let jitter = rand::thread_rng().gen_range(0..50);
+                    let new_duration = duration + Duration::from_millis(jitter);
+                    node.advance_time_by(new_duration);
+                }
             }
 
             pub fn advance_time_by(&mut self, duration: Duration) {
@@ -2342,7 +2346,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(3, cluster_config);
             cluster.start();
-            cluster.advance_time_by(ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
             cluster.wait_for_stable_leader(MAX_TICKS);
             let log_index = cluster.send_client_request("a".to_string(), 1, LogEntryCommand::Set);
             let expected_log_entry = LogEntry {
