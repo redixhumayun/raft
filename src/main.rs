@@ -629,17 +629,22 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         self.reset_election_timeout(&mut state_guard);
 
-        // log consistency check
-        let prev_log_index = request.prev_log_index.saturating_sub(1) as usize;
+        // log consistency check - check that the term and the index match at the log entry the leader expects
+        let log_index_to_check = request.prev_log_index.saturating_sub(1) as usize;
         let prev_log_term = state_guard
             .log
-            .get(prev_log_index)
+            .get(log_index_to_check)
             .map_or(0, |entry| entry.term);
+        let prev_log_index = state_guard
+            .log
+            .get(log_index_to_check)
+            .map_or(0, |entry| entry.index);
         let log_ok = request.prev_log_index == 0
             || (request.prev_log_index > 0
                 && request.prev_log_index <= state_guard.log.len() as u64
                 && request.prev_log_term == prev_log_term);
 
+        debug!("The message has prev_log_index: {} and prev_log_term: {} and the node's log has prev_log_index: {} and prev_log_term: {}", request.prev_log_index, request.prev_log_term, prev_log_index, prev_log_term);
         //  the log check is not OK, give false response
         if !log_ok {
             debug!("The node's log is {:?}", state_guard.log);
@@ -671,108 +676,16 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        //  the request can be accepted, try and append the logs
-        let log_index = request.prev_log_index + 1; //  the first log index will be 1
-
-        //  if the number of log entries in the request are already present in the node log, check if its all already present
-        let mut duplicates = false;
-        if self.len_as_u64(&state_guard.log) > log_index
-            && (self.len_as_u64(&state_guard.log) - log_index) == self.len_as_u64(&request.entries)
-        {
-            duplicates = true;
-            let mut follower_index = log_index;
-            for entry in &request.entries {
-                let follower_entry =
-                    state_guard
-                        .log
-                        .get((follower_index - 1) as usize)
-                        .expect(&format!(
-                            "There is no entry at index for the follower {}",
-                            follower_index - 1
-                        ));
-                if follower_entry.index != entry.index && follower_entry.term != entry.term {
-                    duplicates = false;
-                }
-                follower_index += 1;
-            }
-        }
-
-        if duplicates {
-            debug!("The logs are already present, returning success");
-            debug!("EXIT: handle_append_entries_request for node {}", self.id);
-            return AppendEntriesResponse {
-                request_id: request.request_id,
-                server_id: self.id,
-                term: state_guard.current_term,
-                success: true,
-                match_index: state_guard.log.last().map_or(0, |entry| entry.index),
-            };
-        }
-
-        //  Now, we know the prefix is ok. First, check that there are no subsequent logs on the follower.
-        //  If there are subequent logs, and there is a conflict, discard logs from the conflict point onwards
-        if self.len_as_u64(&state_guard.log) > log_index {
-            debug!("Checking the suffix of the logs on the follower");
-            let max_range = min(
-                self.len_as_u64(&state_guard.log) - log_index,
-                self.len_as_u64(&request.entries),
-            );
-            let mut conflict_point = -1;
-            let mut new_entries_conflict_point = -1;
-
-            //  Check if a conflict point exists. Also check if all the logs are already replicated on this follower
-            for index in 0..max_range {
-                let follower_entry = state_guard
-                    .log
-                    .get((log_index - 1 + index) as usize)
-                    .expect(&format!(
-                        "There is no entry at index for the follower {}",
-                        log_index - 1 + index
-                    ));
-
-                let message_entry = request.entries.get((index) as usize).expect(&format!(
-                    "There is no entry at index {} in the request entries array",
-                    index
-                ));
-
-                if follower_entry.term != message_entry.term {
-                    conflict_point = (log_index - 1 + index) as i64;
-                    new_entries_conflict_point = index as i64;
-                    break;
-                }
-            }
-
-            if conflict_point != -1 {
-                debug!(
-                    "Conflict point detected at {}, truncating logs for node {}",
-                    conflict_point, self.id
-                );
-                debug!("Log before truncating: {:?}", state_guard.log);
-                state_guard.log.truncate(conflict_point as usize);
-                debug!("Log after truncating: {:?}", state_guard.log);
-            } else {
-                conflict_point = self.len_as_u64(&state_guard.log) as i64;
-            }
-
-            //  Now, start appending logs from the conflict point onwards
-            let entries_to_insert = &request.entries[(new_entries_conflict_point as usize)..];
-            state_guard.log.extend_from_slice(entries_to_insert);
+        //  if there are any subsequent logs on the follower, truncate them and append the new logs
+        if self.len_as_u64(&state_guard.log) > request.prev_log_index {
+            state_guard.log.truncate(request.prev_log_index as usize);
+            state_guard.log.extend_from_slice(&request.entries);
             if let Err(e) = self
                 .persistence_manager
-                .append_logs_at(&entries_to_insert.to_vec(), conflict_point as u64)
+                .append_logs_at(&request.entries, request.prev_log_index.saturating_sub(1))
             {
-                error!(
-                    "There was a problem appending logs to stable storage for node {}: {}",
-                    self.id, e
-                );
+                error!("There was a problem appending logs to stable storage for node {} at position {}: {}", self.id, request.prev_log_index - 1, e);
             }
-            if request.leader_commit_index > state_guard.commit_index {
-                state_guard.commit_index = min(
-                    request.leader_commit_index,
-                    self.len_as_u64(&state_guard.log),
-                );
-            }
-            debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 request_id: request.request_id,
                 server_id: self.id,
@@ -816,6 +729,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         if !response.success {
             //  reduce the next index for that server and try again
+            debug!("The append entry request was not successful, decrementing next_index and retrying request");
             state_guard.next_index[server_index] = state_guard.next_index[server_index]
                 .saturating_sub(1)
                 .max(1);
@@ -880,6 +794,10 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         let new_next_index_of_follower = next_index_of_follower.saturating_sub(1).max(1);
         state_guard.next_index[server_index] = new_next_index_of_follower as u64;
 
+        debug!(
+            "The next index of follower {} was {} and now it is {}",
+            to_server_id, next_index_of_follower, new_next_index_of_follower
+        );
         let entries_to_send = state_guard
             .log
             .get(new_next_index_of_follower - 1..)
@@ -913,6 +831,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             entries: entries_to_send,
             leader_commit_index: state_guard.commit_index,
         };
+        debug!("Retrying append entries with request {:?}", request);
         let message = RPCMessage::<T>::AppendEntriesRequest(request);
         let to_address = self
             .config
@@ -1382,7 +1301,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             let result = self.state_machine.apply_get(key);
             results.push((key, result));
         }
-        return results;
+        results
     }
     //  End helper functions
 
@@ -1435,8 +1354,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         if let Ok(message_wrapper) = self.from_rpc_receiver.try_recv() {
             // info!("Received a message on node {}: {:?}", self.id, message);
             info!(
-                "Received message on node {} from node {} {:?}",
-                self.id, message_wrapper.from_node_id, message_wrapper.message
+                "Received message from node {} on node {} {:?}",
+                message_wrapper.from_node_id, self.id, message_wrapper.message
             );
             if let Some((message_response, from_id)) = self.receive(message_wrapper.clone()) {
                 let to_address = self.config.id_to_address_mapping.get(&from_id).expect(
@@ -1644,7 +1563,7 @@ mod tests {
                     let response = node.receive(message.clone());
                     responses.push(response);
                 }
-                return responses;
+                responses
             }
 
             pub fn get_by_id(
@@ -1675,6 +1594,15 @@ mod tests {
                 &mut self,
             ) -> Option<&mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
                 self.nodes.iter_mut().filter(|node| node.is_leader()).last()
+            }
+
+            pub fn get_follower_mut(
+                &mut self,
+            ) -> Option<&mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes
+                    .iter_mut()
+                    .filter(|node| !node.is_leader())
+                    .last()
             }
 
             pub fn drop_node(&mut self, id: ServerId) -> bool {
@@ -1732,6 +1660,27 @@ mod tests {
                     debug!("is_in_log: {}, is_applied: {}", is_in_log, is_applied);
                     if is_in_log && is_applied {
                         info!("Took {} ticks to apply the entry across the cluster", ticks);
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                false
+            }
+
+            pub fn verify_logs_across_cluster(
+                &mut self,
+                expected_log_entries: &Vec<LogEntry<i32>>,
+                max_ticks: u64,
+            ) -> bool {
+                let mut ticks = 0;
+                while ticks < max_ticks {
+                    let is_in_log = self.nodes.iter().all(|node| {
+                        let state_guard = node.state.lock().unwrap();
+                        state_guard.log == *expected_log_entries
+                    });
+                    if is_in_log {
+                        info!("Took {} ticks to verify the logs across the cluster", ticks);
                         return true;
                     }
                     self.tick();
@@ -2397,6 +2346,10 @@ mod tests {
             assert_eq!(apply_entry_result, true);
         }
 
+        /// This test models the scenario where a follower has an additional entry that has not been committed across the cluster and is absent on the leader
+        /// The situation in which this could potentially come up is when there are three nodes - A, B & C. C is the leader and receives a client request
+        /// and appends it to its own log but then crashes before it can replicate it. A becomes the leader and C comes back online. However, C now has an
+        /// additional log entry that is not present on the leader
         #[test]
         fn retry_failed_append_entry_request() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -2443,9 +2396,30 @@ mod tests {
             let apply_entry_result_2 =
                 cluster.wait_until_entry_applied(&expected_log_entry_2, log_index_2, MAX_TICKS);
 
-            cluster.stop();
             assert_eq!(apply_entry_result, true);
             assert_eq!(apply_entry_result_2, true);
+
+            debug!("Healing starts here!");
+            //  now change the log on one of the followers so that the log check fails
+            {
+                let follower_node = cluster.get_follower_mut().unwrap();
+                let mut follower_node_state_guard = follower_node.state.lock().unwrap();
+                debug!("Changing log for node {}", follower_node.id);
+                follower_node_state_guard.log.pop();
+                follower_node_state_guard.log.push(LogEntry {
+                    term: 2,
+                    index: 3,
+                    command: LogEntryCommand::Set,
+                    key: "c".to_string(),
+                    value: 2,
+                });
+            }
+
+            //  wait for the cluster to "heal" and assert that the logs are up to date
+            let expected_log_entries = vec![expected_log_entry, expected_log_entry_2];
+            let result = cluster.verify_logs_across_cluster(&expected_log_entries, MAX_TICKS);
+            cluster.stop();
+            assert_eq!(result, true);
         }
     }
 }
