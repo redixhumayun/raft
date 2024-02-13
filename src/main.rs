@@ -318,6 +318,7 @@ struct VoteResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct AppendEntriesRequest<T: Clone> {
+    request_id: u16,
     term: Term,
     leader_id: ServerId,
     prev_log_index: u64,
@@ -328,6 +329,7 @@ struct AppendEntriesRequest<T: Clone> {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct AppendEntriesResponse {
+    request_id: u16,
     server_id: ServerId,
     term: Term,
     success: bool,
@@ -617,6 +619,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             debug!("The term in the request is less than the current term, ignoring the request");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
+                request_id: request.request_id,
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
@@ -643,6 +646,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             debug!("The log check failed because request has prev_log_index as {} and prev_log_term as {} and the node has prev_log_index as {} and prev_log_term as {}", request.prev_log_index, request.prev_log_term, state_guard.log.len(), prev_log_term);
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
+                request_id: request.request_id,
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: false,
@@ -659,6 +663,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             debug!("This is a heartbeat message, returning success");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
+                request_id: request.request_id,
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
@@ -696,6 +701,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             debug!("The logs are already present, returning success");
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
+                request_id: request.request_id,
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
@@ -768,6 +774,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             }
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
+                request_id: request.request_id,
                 server_id: self.id,
                 term: state_guard.current_term,
                 success: true,
@@ -785,8 +792,13 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             );
         }
 
+        debug!(
+            "The new match index is {}",
+            state_guard.log.last().map_or(0, |entry| entry.index)
+        );
         debug!("EXIT: handle_append_entries_request for node {}", self.id);
         AppendEntriesResponse {
+            request_id: request.request_id,
             server_id: self.id,
             term: state_guard.current_term,
             success: true,
@@ -893,6 +905,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         };
 
         let request = AppendEntriesRequest {
+            request_id: rand::thread_rng().gen(),
             term: state_guard.current_term,
             leader_id: self.id,
             prev_log_index,
@@ -1221,10 +1234,11 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             }
 
             let heartbeat_request = AppendEntriesRequest {
+                request_id: rand::thread_rng().gen(),
                 term: state_guard.current_term,
                 leader_id: self.id,
-                prev_log_index: state_guard.log.last().map_or(0, |entry| entry.term),
-                prev_log_term: state_guard.log.last().map_or(0, |entry| entry.index),
+                prev_log_index: state_guard.log.last().map_or(0, |entry| entry.index),
+                prev_log_term: state_guard.log.last().map_or(0, |entry| entry.term),
                 entries: Vec::<LogEntry<T>>::new(),
                 leader_commit_index: state_guard.commit_index,
             };
@@ -1319,6 +1333,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 continue;
             }
             let append_entry_request = AppendEntriesRequest {
+                request_id: rand::thread_rng().gen(),
                 term: state_guard.current_term,
                 leader_id: self.id,
                 prev_log_index,
@@ -1955,6 +1970,7 @@ mod tests {
             }
 
             let request = AppendEntriesRequest {
+                request_id: 1,
                 term: 1,
                 leader_id: 1,
                 prev_log_index: 0,
@@ -1983,6 +1999,7 @@ mod tests {
             assert_eq!(
                 *append_response,
                 AppendEntriesResponse {
+                    request_id: 1,
                     term: 1,
                     success: true,
                     server_id: 0,
@@ -2023,6 +2040,7 @@ mod tests {
             cluster.send_message_to_all_nodes(vote_message_wrapper);
 
             let request = AppendEntriesRequest {
+                request_id: 1,
                 term: 1,
                 leader_id: 1,
                 prev_log_index: 0,
@@ -2152,6 +2170,7 @@ mod tests {
                 },
             ];
             let request = AppendEntriesRequest {
+                request_id: 1,
                 term: 2,
                 leader_id: 1,
                 prev_log_index: 1,
@@ -2376,6 +2395,57 @@ mod tests {
                 cluster.wait_until_entry_applied(&expected_log_entry, log_index, MAX_TICKS);
             cluster.stop();
             assert_eq!(apply_entry_result, true);
+        }
+
+        #[test]
+        fn retry_failed_append_entry_request() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+            cluster.start();
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            let log_index = cluster.send_client_request("a".to_string(), 1, LogEntryCommand::Set);
+            let expected_log_entry = LogEntry {
+                term: cluster
+                    .get_leader()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .current_term,
+                index: (log_index + 1) as u64, //  log indices in raft are 1-based
+                command: LogEntryCommand::Set,
+                key: "a".to_string(),
+                value: 1,
+            };
+            let apply_entry_result =
+                cluster.wait_until_entry_applied(&expected_log_entry, log_index, MAX_TICKS);
+
+            let log_index_2 = cluster.send_client_request("b".to_string(), 1, LogEntryCommand::Set);
+            let expected_log_entry_2 = LogEntry {
+                term: cluster
+                    .get_leader()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .current_term,
+                index: (log_index_2 + 1) as u64, //  log indices in raft are 1-based
+                command: LogEntryCommand::Set,
+                key: "b".to_string(),
+                value: 1,
+            };
+            let apply_entry_result_2 =
+                cluster.wait_until_entry_applied(&expected_log_entry_2, log_index_2, MAX_TICKS);
+
+            cluster.stop();
+            assert_eq!(apply_entry_result, true);
+            assert_eq!(apply_entry_result_2, true);
         }
     }
 }
