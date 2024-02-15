@@ -302,6 +302,7 @@ impl PartialEq for RPCMessage<i32> {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct VoteRequest {
+    request_id: u16,
     term: Term,
     candidate_id: ServerId,
     last_log_index: u64,
@@ -310,6 +311,7 @@ struct VoteRequest {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct VoteResponse {
+    request_id: u16,
     term: Term,
     vote_granted: bool,
     candidate_id: ServerId, //  the id of the server granting the vote, used for de-duplication
@@ -497,6 +499,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         if request.term < state_guard.current_term {
             debug!("EXIT: handle_vote_request on node {}. Not granting the vote because request term is lower", self.id);
             return VoteResponse {
+                request_id: request.request_id,
                 term: state_guard.current_term,
                 vote_granted: false,
                 candidate_id: self.id,
@@ -507,6 +510,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         if state_guard.voted_for != None && state_guard.voted_for != Some(request.candidate_id) {
             debug!("EXIT: handle_vote_request on node {}. Not granting the vote because the node has already voted for someone else", self.id);
             return VoteResponse {
+                request_id: request.request_id,
                 term: state_guard.current_term,
                 vote_granted: false,
                 candidate_id: self.id,
@@ -521,6 +525,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
 
         if !log_check {
             return VoteResponse {
+                request_id: request.request_id,
                 term: state_guard.current_term,
                 vote_granted: false,
                 candidate_id: self.id,
@@ -543,6 +548,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             self.id, request.candidate_id
         );
         VoteResponse {
+            request_id: request.request_id,
             term: state_guard.current_term,
             vote_granted: true,
             candidate_id: self.id,
@@ -1123,6 +1129,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             }
             //  send out a vote request to all the remaining nodes
             let vote_request = VoteRequest {
+                request_id: rand::thread_rng().gen(),
                 term: state_guard.current_term,
                 candidate_id: self.id,
                 last_log_index: state_guard.log.last().map_or(0, |entry| entry.index),
@@ -1190,6 +1197,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
                 RaftNodeStatus::Candidate => {
                     state_guard.status = RaftNodeStatus::Follower;
                     self.reset_election_timeout(state_guard);
+                    self.start_election(state_guard);
                 }
                 RaftNodeStatus::Follower => {
                     self.reset_election_timeout(state_guard);
@@ -2065,6 +2073,7 @@ mod tests {
             let mut cluster = TestCluster::new(1, cluster_config);
 
             let request = VoteRequest {
+                request_id: 1,
                 term: 1,
                 candidate_id: 1,
                 last_log_index: 0,
@@ -2087,6 +2096,7 @@ mod tests {
             assert_eq!(
                 *vote_response,
                 VoteResponse {
+                    request_id: 1,
                     term: 1,
                     vote_granted: true,
                     candidate_id: 0
@@ -2126,6 +2136,7 @@ mod tests {
             drop(node_state);
 
             let request = VoteRequest {
+                request_id: 1,
                 term: 1,
                 candidate_id: 1,
                 last_log_index: 1,
@@ -2146,6 +2157,7 @@ mod tests {
             assert_eq!(
                 *vote_response,
                 VoteResponse {
+                    request_id: 1,
                     term: 2,
                     vote_granted: false,
                     candidate_id: 0
@@ -2226,6 +2238,7 @@ mod tests {
             let mut cluster = TestCluster::new(1, cluster_config);
 
             let vote_request = VoteRequest {
+                request_id: 1,
                 term: 1,
                 candidate_id: 1,
                 last_log_index: 0,
@@ -2550,7 +2563,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(3, cluster_config);
             cluster.start();
-            cluster.advance_time_by(ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
             cluster.wait_for_stable_leader(MAX_TICKS);
             let (current_leader_id, current_leader_term) = {
                 let leader = cluster.get_leader().unwrap();
@@ -2576,7 +2589,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(3, cluster_config);
             cluster.start();
-            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
             cluster.wait_for_stable_leader(MAX_TICKS);
             let current_leader_term = cluster
                 .get_leader()
@@ -2605,11 +2618,6 @@ mod tests {
             cluster.verify_logs_across_cluster_for(vec![&log_entry], MAX_TICKS);
         }
 
-        /// This test models the scenario where a follower has an additional entry that has not been committed across the cluster and is absent on the leader
-        /// The situation in which this could potentially come up is when there are three nodes - A, B & C. C is the leader and receives a client request
-        /// and appends it to its own log but then crashes before it can replicate it. A becomes the leader and C comes back online. However, C now has an
-        /// additional log entry that is not present on the leader
-
         /// This test models the scenario where a follower has a log entry that is out of sync with the leader. When the leader sends a heartbeat, it will
         /// recognize this and attempt to fix the incorrect log entry by rewinding the log back to a point where there is no conflict
         #[test]
@@ -2622,7 +2630,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(3, cluster_config);
             cluster.start();
-            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
             cluster.wait_for_stable_leader(MAX_TICKS);
             assert_eq!(cluster.has_leader(), true);
 
@@ -2697,7 +2705,7 @@ mod tests {
             };
             let mut cluster = TestCluster::new(3, cluster_config);
             cluster.start();
-            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
             cluster.wait_for_stable_leader(MAX_TICKS);
 
             //  partition the leader from the rest of the group
@@ -2735,7 +2743,7 @@ mod tests {
 
             //  cluster starts and a leader is elected
             cluster.start();
-            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
             cluster.wait_for_stable_leader(MAX_TICKS);
             assert_eq!(cluster.has_leader(), true);
 
@@ -2835,6 +2843,21 @@ mod tests {
                 vec![&log_entry_1, &log_entry_2, &log_entry_3],
                 MAX_TICKS,
             );
+        }
+
+        #[test]
+        fn concurrent_leader_election() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+
+            cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
+            cluster.wait_for_stable_leader(MAX_TICKS * 3); //  use 3 times the MAX_TICKS to ensure that the cluster has enough time to converge on a node
+            assert_eq!(cluster.has_leader(), true);
         }
     }
 }
