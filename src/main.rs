@@ -658,13 +658,11 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             };
         }
 
-        //  update the commit index on this node and apply all pending entries
-        state_guard.commit_index = request.leader_commit_index;
-        self.apply_entries(&mut state_guard);
-
         if request.entries.len() == 0 {
             //  this is a  heartbeat message
             debug!("This is a heartbeat message, returning success");
+            state_guard.commit_index = request.leader_commit_index;
+            self.apply_entries(&mut state_guard);
             debug!("EXIT: handle_append_entries_request for node {}", self.id);
             return AppendEntriesResponse {
                 request_id: request.request_id,
@@ -742,10 +740,14 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
             "The response was successful, updating next index and match index for server {} and the response is {:?}",
             response.server_id, response
         );
+        debug!(
+            "The old set of next indices {:?} and match indices{:?}",
+            state_guard.next_index, state_guard.match_index
+        );
         state_guard.next_index[(response.server_id) as usize] = response.match_index + 1;
         state_guard.match_index[(response.server_id) as usize] = response.match_index;
         debug!(
-            "The new set of next indices and match indices are: {:?} and {:?}",
+            "The new set of next indices {:?} and match indices {:?}",
             state_guard.next_index, state_guard.match_index
         );
         self.advance_commit_index(&mut state_guard);
@@ -914,6 +916,7 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         );
         while state_guard.last_applied < state_guard.commit_index {
             debug!("Updating the state machine for node {}", self.id);
+            debug!("The current log is {:?}", state_guard.log);
             state_guard.last_applied += 1;
             let entry_at_index = state_guard
                 .log
@@ -1245,7 +1248,8 @@ impl<T: RaftTypeTrait, S: StateMachine<T> + Send, F: RaftFileOps<T> + Send> Raft
         //  update the match index of the leader
         //  This isn't strictly required but it makes subsequent calculations to advance the
         //  commit_index easier
-        state_guard.match_index[self.id as usize] += 1;
+        // state_guard.match_index[self.id as usize] += 1;
+        state_guard.match_index[self.id as usize] = state_guard.last_applied + 1;
         for peer in &self.peers {
             if *peer == self.id {
                 continue;
@@ -1454,10 +1458,14 @@ mod tests {
     use super::*;
     mod common {
 
-        use std::collections::{BTreeMap, HashSet};
+        use std::{
+            collections::{BTreeMap, HashSet},
+            iter::zip,
+        };
 
         use super::*;
         use storage::DirectFileOpsWriter;
+        #[derive(Clone)]
         pub struct ClusterConfig {
             pub election_timeout: Duration,
             pub heartbeat_interval: Duration,
@@ -1596,24 +1604,6 @@ mod tests {
                 self.nodes.iter().filter(|node| node.is_leader()).count() == 1
             }
 
-            // /// This function will check that the partitioned cluster the node_id is a part of has a leader
-            // pub fn has_leader_in_partition(&self, node_id: ServerId) -> bool {
-            //     let node_ids_in_cluster = self.connectivity.borrow().get(&node_id).unwrap();
-            //     let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = self
-            //         .nodes
-            //         .iter()
-            //         .filter(|node| node_ids_in_cluster.contains(&node.id))
-            //         .collect();
-            //     debug!("Node ids: {:?}", node_ids_in_cluster);
-            //     nodes
-            //         .iter()
-            //         .filter(|node| {
-            //             debug!("node {} is leader {}", node.id, node.is_leader());
-            //             node.is_leader()
-            //         })
-            //         .count()
-            //         == 1
-            // }
             pub fn has_leader_in_partition(&self, group: &[ServerId]) -> bool {
                 let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = group
                     .iter()
@@ -1632,6 +1622,26 @@ mod tests {
                 &mut self,
             ) -> Option<&mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
                 self.nodes.iter_mut().filter(|node| node.is_leader()).last()
+            }
+
+            pub fn get_leader_in_cluster(
+                &self,
+                group: &[ServerId],
+            ) -> Option<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes
+                    .iter()
+                    .filter(|node| group.contains(&node.id) && node.is_leader())
+                    .last()
+            }
+
+            pub fn get_leader_mut_in_cluster(
+                &mut self,
+                group: &[ServerId],
+            ) -> Option<&mut RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> {
+                self.nodes
+                    .iter_mut()
+                    .filter(|node| group.contains(&node.id) && node.is_leader())
+                    .last()
             }
 
             pub fn get_follower_mut(
@@ -1655,6 +1665,23 @@ mod tests {
                 self.nodes.len() != old_length
             }
 
+            pub fn send_client_request_partition(
+                &mut self,
+                key: String,
+                value: i32,
+                command: LogEntryCommand,
+                group: &[ServerId],
+            ) -> usize {
+                if command == LogEntryCommand::Set {
+                    let leader = self
+                        .get_leader_mut_in_cluster(group)
+                        .expect("Could not find leader in partitioned cluster");
+                    leader.set_key_value_pair(key, value).unwrap()
+                } else {
+                    0
+                }
+            }
+
             pub fn send_client_request(
                 &mut self,
                 key: String,
@@ -1669,7 +1696,7 @@ mod tests {
                 }
             }
 
-            pub fn wait_for_stable_leader_in_partition(
+            pub fn wait_for_stable_leader_partition(
                 &mut self,
                 max_ticks: u64,
                 group: &[ServerId],
@@ -1695,6 +1722,46 @@ mod tests {
                         break;
                     }
                     if self.has_leader() {
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                false
+            }
+
+            pub fn wait_until_entry_applied_partition(
+                &mut self,
+                log_entry: &LogEntry<i32>,
+                expected_index: usize,
+                max_ticks: u64,
+                group: &[ServerId],
+            ) -> bool {
+                let mut ticks = 0;
+                while ticks < max_ticks {
+                    let is_in_log = self
+                        .nodes
+                        .iter()
+                        .filter(|node| group.contains(&node.id))
+                        .all(|node| {
+                            let state_guard = node.state.lock().unwrap();
+                            state_guard.log.get(expected_index) == Some(&log_entry)
+                        });
+                    let key = &log_entry.key;
+                    let is_applied = self
+                        .nodes
+                        .iter()
+                        .filter(|node| group.contains(&node.id))
+                        .all(|node| {
+                            let r = node.state_machine.apply_get(key).is_some();
+                            r
+                        });
+                    debug!("is_in_log: {}, is_applied: {}", is_in_log, is_applied);
+                    if is_in_log && is_applied {
+                        info!(
+                            "Took {} ticks to apply the entry across the partitioned cluster",
+                            ticks
+                        );
                         return true;
                     }
                     self.tick();
@@ -1731,16 +1798,92 @@ mod tests {
                 false
             }
 
-            pub fn verify_logs_across_cluster(
+            pub fn apply_entries_across_cluster_partition(
                 &mut self,
-                expected_log_entries: &Vec<LogEntry<i32>>,
+                log_entries: Vec<&LogEntry<i32>>,
+                group: &[ServerId],
+                max_ticks: u64,
+            ) {
+                for log_entry in log_entries {
+                    let log_index = self.send_client_request_partition(
+                        log_entry.key.clone(),
+                        log_entry.value,
+                        LogEntryCommand::Set,
+                        group,
+                    );
+
+                    let applied = self
+                        .wait_until_entry_applied_partition(log_entry, log_index, max_ticks, group);
+                    if !applied {
+                        panic!("Could not apply the log entry across the partitioned cluster");
+                    }
+                }
+            }
+
+            pub fn apply_entries_across_cluster(
+                &mut self,
+                log_entries: Vec<&LogEntry<i32>>,
+                max_ticks: u64,
+            ) {
+                for log_entry in log_entries {
+                    let log_index = self.send_client_request(
+                        log_entry.key.clone(),
+                        log_entry.value,
+                        LogEntryCommand::Set,
+                    );
+
+                    let applied = self.wait_until_entry_applied(log_entry, log_index, max_ticks);
+                    if !applied {
+                        panic!("Could not apply the log entry across the cluster");
+                    }
+                }
+            }
+
+            pub fn verify_logs_across_cluster_partition_for(
+                &mut self,
+                expected_log_entries: Vec<&LogEntry<i32>>,
+                max_ticks: u64,
+                group: &[ServerId],
+            ) -> bool {
+                let mut ticks = 0;
+                while ticks < max_ticks {
+                    let is_in_log = self
+                        .nodes
+                        .iter()
+                        .filter(|node| group.contains(&node.id))
+                        .all(|node| {
+                            let state_guard = node.state.lock().unwrap();
+                            // state_guard.log == expected_log_entries
+                            zip(&state_guard.log, &expected_log_entries)
+                                .into_iter()
+                                .all(|(log_1, expected_log_1)| log_1 == *expected_log_1)
+                        });
+                    if is_in_log {
+                        info!(
+                            "Took {} ticks to verify the logs across the partitioned cluster",
+                            ticks
+                        );
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                false
+            }
+
+            pub fn verify_logs_across_cluster_for(
+                &mut self,
+                expected_log_entries: Vec<&LogEntry<i32>>,
                 max_ticks: u64,
             ) -> bool {
                 let mut ticks = 0;
                 while ticks < max_ticks {
                     let is_in_log = self.nodes.iter().all(|node| {
                         let state_guard = node.state.lock().unwrap();
-                        state_guard.log == *expected_log_entries
+                        // state_guard.log == expected_log_entries
+                        zip(&state_guard.log, &expected_log_entries)
+                            .into_iter()
+                            .all(|(log_1, expected_log_1)| log_1 == *expected_log_1)
                     });
                     if is_in_log {
                         info!("Took {} ticks to verify the logs across the cluster", ticks);
@@ -1767,6 +1910,10 @@ mod tests {
                         .unwrap()
                         .retain(|&id| group2.contains(&id));
                 }
+                debug!(
+                    "The connectivity after partitioning: {:?}",
+                    self.connectivity
+                );
             }
 
             /// Removes any partition in the cluster and restores full connectivity among all nodes
@@ -1796,7 +1943,7 @@ mod tests {
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
                 let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> =
                     Vec::new();
-                let mut nodes_map: BTreeMap<
+                let nodes_map: BTreeMap<
                     ServerId,
                     RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>,
                 > = BTreeMap::new();
@@ -1847,7 +1994,7 @@ mod tests {
                         mock_clock,
                     );
                     nodes.push(node);
-                    // nodes_map.insert(*node_id, node);
+                    // nodes_map.insert(*node_id, node);    //  TODO: Cannot clone node here. Need to get rid of vector before BTreeMap can be used
                     counter += 1;
                 }
                 let message_queue = Vec::new();
@@ -2431,24 +2578,31 @@ mod tests {
             cluster.start();
             cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
             cluster.wait_for_stable_leader(MAX_TICKS);
-            let log_index = cluster.send_client_request("a".to_string(), 1, LogEntryCommand::Set);
-            let expected_log_entry = LogEntry {
-                term: cluster
-                    .get_leader()
-                    .unwrap()
-                    .state
-                    .lock()
-                    .unwrap()
-                    .current_term,
-                index: (log_index + 1) as u64, //  log indices in raft are 1-based
+            let current_leader_term = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .current_term;
+            let last_log_index = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .log
+                .last()
+                .map_or(0, |entry| entry.index);
+            let log_entry = LogEntry {
+                term: current_leader_term,
+                index: last_log_index + 1,
                 command: LogEntryCommand::Set,
                 key: "a".to_string(),
                 value: 1,
             };
-            let apply_entry_result =
-                cluster.wait_until_entry_applied(&expected_log_entry, log_index, MAX_TICKS);
-            cluster.stop();
-            assert_eq!(apply_entry_result, true);
+            cluster.apply_entries_across_cluster(vec![&log_entry], MAX_TICKS);
+            cluster.verify_logs_across_cluster_for(vec![&log_entry], MAX_TICKS);
         }
 
         /// This test models the scenario where a follower has an additional entry that has not been committed across the cluster and is absent on the leader
@@ -2470,42 +2624,43 @@ mod tests {
             cluster.start();
             cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
             cluster.wait_for_stable_leader(MAX_TICKS);
-            let log_index = cluster.send_client_request("a".to_string(), 1, LogEntryCommand::Set);
-            let expected_log_entry = LogEntry {
-                term: cluster
-                    .get_leader()
-                    .unwrap()
-                    .state
-                    .lock()
-                    .unwrap()
-                    .current_term,
-                index: (log_index + 1) as u64, //  log indices in raft are 1-based
+            assert_eq!(cluster.has_leader(), true);
+
+            let current_leader_term = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .current_term;
+            let mut last_log_index = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .log
+                .last()
+                .map_or(0, |entry| entry.index);
+            last_log_index += 1;
+            let log_entry_1 = LogEntry {
+                term: current_leader_term,
+                index: last_log_index,
                 command: LogEntryCommand::Set,
                 key: "a".to_string(),
                 value: 1,
             };
-            let apply_entry_result =
-                cluster.wait_until_entry_applied(&expected_log_entry, log_index, MAX_TICKS);
-
-            let log_index_2 = cluster.send_client_request("b".to_string(), 1, LogEntryCommand::Set);
-            let expected_log_entry_2 = LogEntry {
-                term: cluster
-                    .get_leader()
-                    .unwrap()
-                    .state
-                    .lock()
-                    .unwrap()
-                    .current_term,
-                index: (log_index_2 + 1) as u64, //  log indices in raft are 1-based
+            last_log_index += 1;
+            let log_entry_2 = LogEntry {
+                term: current_leader_term,
+                index: last_log_index,
                 command: LogEntryCommand::Set,
                 key: "b".to_string(),
                 value: 1,
             };
-            let apply_entry_result_2 =
-                cluster.wait_until_entry_applied(&expected_log_entry_2, log_index_2, MAX_TICKS);
 
-            assert_eq!(apply_entry_result, true);
-            assert_eq!(apply_entry_result_2, true);
+            cluster.apply_entries_across_cluster(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
+            cluster.verify_logs_across_cluster_for(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
 
             debug!("Healing starts here!");
             //  now change the log on one of the followers so that the log check fails
@@ -2524,8 +2679,8 @@ mod tests {
             }
 
             //  wait for the cluster to "heal" and assert that the logs are up to date
-            let expected_log_entries = vec![expected_log_entry, expected_log_entry_2];
-            let result = cluster.verify_logs_across_cluster(&expected_log_entries, MAX_TICKS);
+            let expected_log_entries = vec![&log_entry_1, &log_entry_2];
+            let result = cluster.verify_logs_across_cluster_for(expected_log_entries, MAX_TICKS);
             cluster.stop();
             assert_eq!(result, true);
         }
@@ -2555,9 +2710,131 @@ mod tests {
                 .collect::<Vec<ServerId>>();
             cluster.partition(group1, group2);
             cluster.advance_time_by_for_node(1, ELECTION_TIMEOUT + Duration::from_millis(100));
-            cluster.wait_for_stable_leader_in_partition(MAX_TICKS, group2);
+            cluster.wait_for_stable_leader_partition(MAX_TICKS, group2);
             cluster.stop();
             assert_eq!(cluster.has_leader_in_partition(group2), true);
+        }
+
+        /// The test models the following scenario
+        /// 1. A leader is elected
+        /// 2. Client requests are received and replicated
+        /// 3. A partition occurs and a new leader is elected
+        /// 4. Clients requests are processed by the new leader
+        /// 5. The partition heals and the old leader rejoins the cluster
+        /// 6. The old leader must recognize its a follower and get caught up with the new leader
+
+        #[test]
+        fn network_partition_log_healing() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+
+            //  cluster starts and a leader is elected
+            cluster.start();
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            assert_eq!(cluster.has_leader(), true);
+
+            //  client requests are received and replicated across cluster
+            debug!("Applying entries");
+            let current_leader_term = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .current_term;
+            let mut last_log_index = cluster
+                .get_leader()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .log
+                .last()
+                .map_or(0, |entry| entry.index);
+            last_log_index += 1;
+            let log_entry_1 = LogEntry {
+                term: current_leader_term,
+                index: last_log_index,
+                command: LogEntryCommand::Set,
+                key: "a".to_string(),
+                value: 1,
+            };
+            last_log_index += 1;
+            let log_entry_2 = LogEntry {
+                term: current_leader_term,
+                index: last_log_index,
+                command: LogEntryCommand::Set,
+                key: "b".to_string(),
+                value: 2,
+            };
+            cluster.apply_entries_across_cluster(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
+            cluster.verify_logs_across_cluster_for(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
+
+            //  partition and new leader election here
+            let group1 = &[cluster.get_leader().unwrap().id];
+            let group2 = &cluster
+                .get_all_followers()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<ServerId>>();
+            debug!("PARTITION HERE");
+            cluster.partition(group1, group2);
+            cluster.advance_time_by_for_node(1, ELECTION_TIMEOUT + Duration::from_millis(100));
+            cluster.wait_for_stable_leader_partition(MAX_TICKS, group2);
+            assert_eq!(cluster.has_leader_in_partition(group2), true);
+
+            //  send requests to group2 leader
+            let log_entry_3 = {
+                debug!("GROUP2 REQUESTS");
+                let current_leader_term = cluster
+                    .get_leader_in_cluster(group2)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .current_term;
+                let mut last_log_index = cluster
+                    .get_leader()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .log
+                    .last()
+                    .map_or(0, |entry| entry.index);
+                last_log_index += 1;
+                let log_entry_3 = LogEntry {
+                    term: current_leader_term,
+                    index: last_log_index,
+                    command: LogEntryCommand::Set,
+                    key: "c".to_string(),
+                    value: 3,
+                };
+                cluster.apply_entries_across_cluster_partition(
+                    vec![&log_entry_3],
+                    group2,
+                    MAX_TICKS,
+                );
+                log_entry_3
+            };
+
+            //  partition heals and old leader rejoins the cluster
+            debug!("PARTITION HEALS HERE");
+            let leader_id = cluster.get_leader_in_cluster(group2).unwrap().id;
+            cluster.heal_partition();
+            cluster.tick_by(MAX_TICKS);
+            cluster.wait_for_stable_leader(MAX_TICKS);
+            assert_eq!(cluster.get_leader().unwrap().id, leader_id);
+            cluster.verify_logs_across_cluster_for(
+                vec![&log_entry_1, &log_entry_2, &log_entry_3],
+                MAX_TICKS,
+            );
         }
     }
 }
