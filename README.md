@@ -43,3 +43,12 @@ What I have yet to do:
 
 * Log snapshots
 * Benchmarks
+
+##  Credits
+
+A huge part of accomplishing this was being able to reference existing repos that do a Raft implementation
+
+* Phil Eaton's Raft implementation in Rust (https://github.com/eatonphil/raft-rs)
+* Jacky Zhao's Raft implementation also in Rust (https://github.com/jackyzha0/miniraft)
+
+A large part of the testing inspiration came from the second repo.
