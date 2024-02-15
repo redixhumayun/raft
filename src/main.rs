@@ -2871,6 +2871,7 @@ mod tests {
                 let value = i;
                 test_data.push((key.clone(), Option::Some(value)));
                 cluster.send_client_request(key, value, LogEntryCommand::Set);
+                thread::sleep(Duration::from_millis(10));
             }
 
             //  allow some time to pass
