@@ -50,5 +50,6 @@ A huge part of accomplishing this was being able to reference existing repos tha
 
 * Phil Eaton's Raft implementation in Rust (https://github.com/eatonphil/raft-rs)
 * Jacky Zhao's Raft implementation also in Rust (https://github.com/jackyzha0/miniraft)
+* TLA+ spec of Raft (https://github.com/ongardie/raft.tla/tree/master)
 
 A large part of the testing inspiration came from the second repo.
