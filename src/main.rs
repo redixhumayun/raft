@@ -2831,6 +2831,8 @@ mod tests {
             );
         }
 
+        /// This test forces all the nodes in a cluster to time out at the same time so that it can be asserted
+        /// that the cluster eventually converges on a single leader
         #[test]
         fn concurrent_leader_election() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -2844,6 +2846,46 @@ mod tests {
             cluster.advance_time_by(ELECTION_TIMEOUT + Duration::from_millis(100));
             cluster.wait_for_stable_leader(MAX_TICKS * 3); //  use 3 times the MAX_TICKS to ensure that the cluster has enough time to converge on a node
             assert_eq!(cluster.has_leader(), true);
+        }
+
+        #[test]
+        fn bulk_client_requests_test() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let cluster_config = ClusterConfig {
+                election_timeout: ELECTION_TIMEOUT,
+                heartbeat_interval: HEARTBEAT_INTERVAL,
+                ports: vec![8000, 8001, 8002],
+            };
+            let mut cluster = TestCluster::new(3, cluster_config);
+
+            //  cluster starts and a leader is elected
+            cluster.start();
+            cluster.advance_time_by_for_node(0, ELECTION_TIMEOUT + Duration::from_millis(50));
+            assert!(cluster.wait_for_stable_leader(MAX_TICKS));
+
+            //  Generate and send bulk client requests
+            let num_requests = 100;
+            let mut test_data: Vec<(String, Option<i32>)> = Vec::new();
+            for i in 0..num_requests {
+                let key = format!("key{}", i);
+                let value = i;
+                test_data.push((key.clone(), Option::Some(value)));
+                cluster.send_client_request(key, value, LogEntryCommand::Set);
+            }
+
+            //  allow some time to pass
+            cluster.tick_by(MAX_TICKS * 4);
+            let keys = test_data.iter().map(|(key, _)| key.as_str()).collect();
+            let results = cluster.query_state_machine_across_nodes(keys);
+
+            //  each node's state machine should have all of the test data
+            let expected_results: Vec<(&str, Option<i32>)> = test_data
+                .iter()
+                .map(|(key, value)| (key.as_str(), *value))
+                .collect();
+            for (_, state_machine_results) in results.iter() {
+                assert_eq!(state_machine_results, &expected_results);
+            }
         }
     }
 }
