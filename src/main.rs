@@ -5,7 +5,6 @@ use core::fmt;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::cell::{Ref, RefCell};
-use std::cmp::min;
 use std::io::{self, BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
@@ -1455,7 +1454,7 @@ mod tests {
     use super::*;
     mod common {
 
-        use std::{borrow::Borrow, collections::HashSet};
+        use std::collections::{BTreeMap, HashSet};
 
         use super::*;
         use storage::DirectFileOpsWriter;
@@ -1467,6 +1466,8 @@ mod tests {
 
         pub struct TestCluster {
             pub nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
+            pub nodes_map:
+                BTreeMap<ServerId, RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>>,
             pub message_queue: Vec<MessageWrapper<i32>>,
             pub connectivity: HashMap<ServerId, HashSet<ServerId>>,
             pub config: ClusterConfig,
@@ -1595,23 +1596,30 @@ mod tests {
                 self.nodes.iter().filter(|node| node.is_leader()).count() == 1
             }
 
-            /// This function will check that the partitioned cluster the node_id is a part of has a leader
-            pub fn has_leader_in_partition(&self, node_id: ServerId) -> bool {
-                let node_ids_in_cluster = self.connectivity.borrow().get(&node_id).unwrap();
-                let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = self
-                    .nodes
+            // /// This function will check that the partitioned cluster the node_id is a part of has a leader
+            // pub fn has_leader_in_partition(&self, node_id: ServerId) -> bool {
+            //     let node_ids_in_cluster = self.connectivity.borrow().get(&node_id).unwrap();
+            //     let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = self
+            //         .nodes
+            //         .iter()
+            //         .filter(|node| node_ids_in_cluster.contains(&node.id))
+            //         .collect();
+            //     debug!("Node ids: {:?}", node_ids_in_cluster);
+            //     nodes
+            //         .iter()
+            //         .filter(|node| {
+            //             debug!("node {} is leader {}", node.id, node.is_leader());
+            //             node.is_leader()
+            //         })
+            //         .count()
+            //         == 1
+            // }
+            pub fn has_leader_in_partition(&self, group: &[ServerId]) -> bool {
+                let nodes: Vec<&RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> = group
                     .iter()
-                    .filter(|node| node_ids_in_cluster.contains(&node.id))
+                    .map(|node_id| self.nodes.iter().find(|node| node.id == *node_id).unwrap())
                     .collect();
-                debug!("Node ids: {:?}", node_ids_in_cluster);
-                nodes
-                    .iter()
-                    .filter(|node| {
-                        debug!("node {} is leader {}", node.id, node.is_leader());
-                        return node.is_leader();
-                    })
-                    .count()
-                    == 1
+                nodes.iter().filter(|node| node.is_leader()).count() == 1
             }
 
             pub fn get_leader(
@@ -1659,6 +1667,25 @@ mod tests {
                 } else {
                     0
                 }
+            }
+
+            pub fn wait_for_stable_leader_in_partition(
+                &mut self,
+                max_ticks: u64,
+                group: &[ServerId],
+            ) -> bool {
+                let mut ticks = 0;
+                loop {
+                    if ticks >= max_ticks {
+                        break;
+                    }
+                    if self.has_leader_in_partition(group) {
+                        return true;
+                    }
+                    self.tick();
+                    ticks += 1;
+                }
+                false
             }
 
             pub fn wait_for_stable_leader(&mut self, max_ticks: u64) -> bool {
@@ -1769,6 +1796,11 @@ mod tests {
             pub fn new(number_of_nodes: u64, config: ClusterConfig) -> Self {
                 let mut nodes: Vec<RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>> =
                     Vec::new();
+                let mut nodes_map: BTreeMap<
+                    ServerId,
+                    RaftNode<i32, KeyValueStore<i32>, DirectFileOpsWriter>,
+                > = BTreeMap::new();
+
                 let node_ids: Vec<ServerId> = (0..number_of_nodes).collect();
                 let addresses: Vec<String> = config
                     .ports
@@ -1815,6 +1847,7 @@ mod tests {
                         mock_clock,
                     );
                     nodes.push(node);
+                    // nodes_map.insert(*node_id, node);
                     counter += 1;
                 }
                 let message_queue = Vec::new();
@@ -1826,6 +1859,7 @@ mod tests {
 
                 TestCluster {
                     nodes,
+                    nodes_map,
                     message_queue,
                     connectivity: connectivity_hm,
                     config,
@@ -2520,9 +2554,10 @@ mod tests {
                 .map(|node| node.id)
                 .collect::<Vec<ServerId>>();
             cluster.partition(group1, group2);
-            cluster.tick_by(MAX_TICKS);
-            cluster.has_leader_in_partition(1);
-            // assert_eq!(cluster.has_leader(), true);
+            cluster.advance_time_by_for_node(1, ELECTION_TIMEOUT + Duration::from_millis(100));
+            cluster.wait_for_stable_leader_in_partition(MAX_TICKS, group2);
+            cluster.stop();
+            assert_eq!(cluster.has_leader_in_partition(group2), true);
         }
     }
 }
