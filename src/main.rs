@@ -1453,7 +1453,6 @@ impl<T: RaftTypeTrait> StateMachine<T> for KeyValueStore<T> {
     }
 
     fn apply(&self, entries: Vec<LogEntry<T>>) {
-        debug!("Applying the following entries: {:?}", entries);
         for entry in entries {
             self.store.borrow_mut().insert(entry.key, entry.value);
         }
@@ -1764,7 +1763,6 @@ mod tests {
                             let r = node.state_machine.apply_get(key).is_some();
                             r
                         });
-                    debug!("is_in_log: {}, is_applied: {}", is_in_log, is_applied);
                     if is_in_log && is_applied {
                         info!(
                             "Took {} ticks to apply the entry across the partitioned cluster",
@@ -1795,7 +1793,6 @@ mod tests {
                         let r = node.state_machine.apply_get(key).is_some();
                         r
                     });
-                    debug!("is_in_log: {}, is_applied: {}", is_in_log, is_applied);
                     if is_in_log && is_applied {
                         info!("Took {} ticks to apply the entry across the cluster", ticks);
                         return true;
@@ -1918,10 +1915,6 @@ mod tests {
                         .unwrap()
                         .retain(|&id| group2.contains(&id));
                 }
-                debug!(
-                    "The connectivity after partitioning: {:?}",
-                    self.connectivity
-                );
             }
 
             /// Removes any partition in the cluster and restores full connectivity among all nodes
@@ -2670,12 +2663,10 @@ mod tests {
             cluster.apply_entries_across_cluster(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
             cluster.verify_logs_across_cluster_for(vec![&log_entry_1, &log_entry_2], MAX_TICKS);
 
-            debug!("Healing starts here!");
             //  now change the log on one of the followers so that the log check fails
             {
                 let follower_node = cluster.get_follower_mut().unwrap();
                 let mut follower_node_state_guard = follower_node.state.lock().unwrap();
-                debug!("Changing log for node {}", follower_node.id);
                 follower_node_state_guard.log.pop();
                 follower_node_state_guard.log.push(LogEntry {
                     term: 2,
@@ -2709,7 +2700,6 @@ mod tests {
             cluster.wait_for_stable_leader(MAX_TICKS);
 
             //  partition the leader from the rest of the group
-            debug!("PARTITION HERE");
             let group1 = &[cluster.get_leader().unwrap().id];
             let group2 = &cluster
                 .get_all_followers()
@@ -2730,7 +2720,6 @@ mod tests {
         /// 4. Clients requests are processed by the new leader
         /// 5. The partition heals and the old leader rejoins the cluster
         /// 6. The old leader must recognize its a follower and get caught up with the new leader
-
         #[test]
         fn network_partition_log_healing() {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -2748,7 +2737,6 @@ mod tests {
             assert_eq!(cluster.has_leader(), true);
 
             //  client requests are received and replicated across cluster
-            debug!("Applying entries");
             let current_leader_term = cluster
                 .get_leader()
                 .unwrap()
@@ -2791,7 +2779,6 @@ mod tests {
                 .iter()
                 .map(|node| node.id)
                 .collect::<Vec<ServerId>>();
-            debug!("PARTITION HERE");
             cluster.partition(group1, group2);
             cluster.advance_time_by_for_node(1, ELECTION_TIMEOUT + Duration::from_millis(100));
             cluster.wait_for_stable_leader_partition(MAX_TICKS, group2);
@@ -2799,7 +2786,6 @@ mod tests {
 
             //  send requests to group2 leader
             let log_entry_3 = {
-                debug!("GROUP2 REQUESTS");
                 let current_leader_term = cluster
                     .get_leader_in_cluster(group2)
                     .unwrap()
@@ -2833,7 +2819,7 @@ mod tests {
             };
 
             //  partition heals and old leader rejoins the cluster
-            debug!("PARTITION HEALS HERE");
+            //  cluster needs to be verified to ensure all logs are up to date
             let leader_id = cluster.get_leader_in_cluster(group2).unwrap().id;
             cluster.heal_partition();
             cluster.tick_by(MAX_TICKS);
